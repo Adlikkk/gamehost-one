@@ -1,0 +1,147 @@
+@import "tailwindcss";
+@config "../tailwind.config.cjs";
+
+/* Keep the document fully transparent for the custom window chrome. */
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: transparent;
+  color: #e6eaf0;
+  font-family: "Sora", system-ui, sans-serif;
+  overflow: hidden;
+}
+
+.segmented-bar {
+  background-image: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.35) 0 6px,
+    rgba(255, 255, 255, 0.08) 6px 10px
+  );
+  background-size: 10px 100%;
+}
+
+.select-content {
+  background-color: #151a21;
+  opacity: 1;
+}
+
+.select-content[data-state="open"] {
+  background-color: #151a21;
+  opacity: 1;
+}
+
+#root {
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+}
+
+/* Two-layer window structure: transparent shell + rounded app surface. */
+.window-root {
+  height: 100%;
+  background: #0b0f14;
+  border-radius: 0;
+  overflow: hidden;
+}
+
+.window-root.window-root-max {
+  border-radius: 0;
+}
+
+.app-root {
+  min-height: 100%;
+  border-radius: 0;
+  background: radial-gradient(circle at top, rgba(79, 124, 255, 0.08), transparent 45%),
+    linear-gradient(180deg, #0e1116 0%, #0b0f14 100%);
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+  outline: 1px solid rgba(255, 255, 255, 0.02);
+}
+
+.app-root.maximized {
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.content-scroll {
+  scrollbar-gutter: stable;
+}
+
+/* Custom titlebar drag regions. */
+.titlebar {
+  -webkit-app-region: drag;
+}
+
+.no-drag {
+  -webkit-app-region: no-drag;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+/* Fallback palette utilities if Tailwind config colors do not load. */
+.text-one {
+  color: #55d6cf;
+}
+
+.text-primary {
+  color: #4f7cff;
+}
+
+.text-secondary {
+  color: #2ed573;
+}
+
+.text-danger {
+  color: #e25555;
+}
+
+.bg-primary {
+  background-color: #4f7cff;
+}
+
+.bg-secondary {
+  background-color: #2ed573;
+}
+
+.bg-danger {
+  background-color: #e25555;
+}
+
+.bg-primary\/20 {
+  background-color: rgba(79, 124, 255, 0.2);
+}
+
+.bg-secondary\/20 {
+  background-color: rgba(46, 213, 115, 0.2);
+}
+
+.bg-danger\/20 {
+  background-color: rgba(226, 85, 85, 0.2);
+}
+
+.bg-danger\/15 {
+  background-color: rgba(226, 85, 85, 0.15);
+}
