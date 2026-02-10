@@ -16,10 +16,19 @@
       "identifier": "opener:allow-open-path",
       "allow": [
         {
+          "path": "$APPDATA"
+        },
+        {
           "path": "$APPDATA/**"
         },
         {
           "path": "$APPDATA/com.gamehost.one/**"
+        },
+        {
+          "path": "$DATA/.minecraft"
+        },
+        {
+          "path": "$DATA/.minecraft/**"
         }
       ]
     },

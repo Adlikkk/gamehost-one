@@ -1447,6 +1447,101 @@ fn detect_minecraft_client() -> Result<MinecraftClientStatus, String> {
     })
 }
 
+#[cfg(target_os = "windows")]
+fn try_open_protocol(url: &str) -> Result<(), String> {
+    Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn candidate_paths_for_launcher(choice: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let program_files = std::env::var("PROGRAMFILES").ok();
+    let program_files_x86 = std::env::var("PROGRAMFILES(X86)").ok();
+    let local_appdata = std::env::var("LOCALAPPDATA").ok();
+    let appdata = std::env::var("APPDATA").ok();
+
+    match choice {
+        "official" => {
+            if let Some(base) = program_files_x86.as_ref() {
+                paths.push(PathBuf::from(base).join("Minecraft Launcher").join("MinecraftLauncher.exe"));
+            }
+            if let Some(base) = program_files.as_ref() {
+                paths.push(PathBuf::from(base).join("Minecraft Launcher").join("MinecraftLauncher.exe"));
+            }
+            if let Some(base) = local_appdata.as_ref() {
+                paths.push(PathBuf::from(base).join("Microsoft").join("WindowsApps").join("MinecraftLauncher.exe"));
+            }
+            if let Some(base) = appdata.as_ref() {
+                paths.push(PathBuf::from(base).join(".minecraft").join("launcher").join("minecraft.exe"));
+            }
+        }
+        "tlauncher" => {
+            if let Some(base) = appdata.as_ref() {
+                paths.push(PathBuf::from(base).join(".minecraft").join("TLauncher.exe"));
+                paths.push(PathBuf::from(base).join(".tlauncher").join("TLauncher.exe"));
+            }
+            if let Some(base) = local_appdata.as_ref() {
+                paths.push(PathBuf::from(base).join("TLauncher").join("TLauncher.exe"));
+            }
+            if let Some(base) = program_files_x86.as_ref() {
+                paths.push(PathBuf::from(base).join("TLauncher").join("TLauncher.exe"));
+            }
+            if let Some(base) = program_files.as_ref() {
+                paths.push(PathBuf::from(base).join("TLauncher").join("TLauncher.exe"));
+            }
+        }
+        _ => {}
+    }
+
+    paths
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_launcher(path: &Path) -> Result<(), String> {
+    Command::new(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn launch_minecraft(choice: String, version: Option<String>) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let normalized = choice.to_lowercase();
+        if normalized == "official" {
+            if let Some(version) = version.as_ref() {
+                let url = format!("minecraft://launch/?version={}", version);
+                if try_open_protocol(&url).is_ok() {
+                    return Ok(());
+                }
+            }
+            if try_open_protocol("minecraft://").is_ok() {
+                return Ok(());
+            }
+        }
+
+        for path in candidate_paths_for_launcher(&normalized) {
+            if path.exists() {
+                return spawn_launcher(&path);
+            }
+        }
+
+        return Err("Minecraft launcher not found.".to_string());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = choice;
+        let _ = version;
+        Err("Launcher integration is currently supported on Windows only.".to_string())
+    }
+}
+
 #[tauri::command]
 fn get_app_settings(app: AppHandle) -> Result<AppSettings, String> {
     let base = app_data_dir(&app)?;
@@ -1541,6 +1636,56 @@ fn clear_crash_reports(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn export_crash_reports(destination: String, app: AppHandle) -> Result<String, String> {
+    if destination.trim().is_empty() {
+        return Err("Missing export path".to_string());
+    }
+    let base = app_data_dir(&app)?;
+    ensure_app_dirs(&base)?;
+    let dir = crashes_dir(&base);
+    if !dir.exists() {
+        return Err("No crash reports to export".to_string());
+    }
+
+    let entries = fs::read_dir(&dir).map_err(|err| err.to_string())?;
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| err.to_string())?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+            files.push(path);
+        }
+    }
+    if files.is_empty() {
+        return Err("No crash reports to export".to_string());
+    }
+
+    let destination_path = PathBuf::from(destination.trim());
+    if let Some(parent) = destination_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        }
+    }
+
+    let file = File::create(&destination_path).map_err(|err| err.to_string())?;
+    let mut zip = ZipWriter::new(file);
+    let options = FileOptions::default();
+
+    for path in files {
+        let name = match path.file_name().and_then(|value| value.to_str()) {
+            Some(value) => value,
+            None => continue,
+        };
+        let content = fs::read(&path).map_err(|err| err.to_string())?;
+        zip.start_file(name, options).map_err(|err| err.to_string())?;
+        zip.write_all(&content).map_err(|err| err.to_string())?;
+    }
+
+    zip.finish().map_err(|err| err.to_string())?;
+    Ok(destination_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
 fn check_for_updates(repo: String, app: AppHandle) -> Result<UpdateInfo, String> {
     let current_version = app.package_info().version.to_string();
     let mut info = UpdateInfo {
@@ -1559,6 +1704,9 @@ fn check_for_updates(repo: String, app: AppHandle) -> Result<UpdateInfo, String>
         .build()
         .map_err(|err| err.to_string())?;
     let response = client.get(url).send().map_err(|err| err.to_string())?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(info);
+    }
     if !response.status().is_success() {
         return Err(format!("Update check failed with {}", response.status()));
     }
@@ -1890,9 +2038,16 @@ fn log_analytics_event(base: &Path, settings: &AppSettings, name: &str) {
     } else {
         Vec::new()
     };
-    list.push(entry);
+    list.push(entry.clone());
     if let Ok(payload) = serde_json::to_string_pretty(&list) {
         let _ = fs::write(path, payload);
+    }
+
+    if let Some(endpoint) = settings.analytics_endpoint.as_deref() {
+        if endpoint.starts_with("http") {
+            let client = reqwest::blocking::Client::new();
+            let _ = client.post(endpoint).json(&entry).send();
+        }
     }
 }
 
@@ -3420,6 +3575,26 @@ pub fn run() {
             let data_dir = app_data_dir(&handle)?;
             ensure_app_dirs(&data_dir)?;
 
+            let hook_handle = handle.clone();
+            let hook_dir = data_dir.clone();
+            std::panic::set_hook(Box::new(move |info| {
+                let message = if let Some(payload) = info.payload().downcast_ref::<&str>() {
+                    payload.to_string()
+                } else if let Some(payload) = info.payload().downcast_ref::<String>() {
+                    payload.clone()
+                } else {
+                    "Unexpected panic".to_string()
+                };
+                let location = info
+                    .location()
+                    .map(|loc| format!("{}:{}", loc.file(), loc.line()))
+                    .unwrap_or_else(|| "unknown".to_string());
+                let full_message = format!("{} ({})", message, location);
+                let settings = load_app_settings(&hook_dir);
+                let app_version = hook_handle.package_info().version.to_string();
+                write_crash_report(&hook_dir, &settings, &app_version, &full_message);
+            }));
+
             let state = AppState {
                 data_dir: data_dir.clone(),
                 registry_path: registry_path(&data_dir),
@@ -3491,12 +3666,14 @@ pub fn run() {
             check_mod_sync,
             download_mods,
             detect_minecraft_client,
+            launch_minecraft,
             get_app_settings,
             update_app_settings,
             list_crash_reports,
             get_crash_report,
             delete_crash_report,
             clear_crash_reports,
+            export_crash_reports,
             check_for_updates,
             download_update,
             get_forge_versions,

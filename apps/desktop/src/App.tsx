@@ -91,7 +91,7 @@ type JavaStatusResult = {
   runtime_major?: number | null;
 };
 
-type LauncherChoice = "official" | "custom";
+type LauncherChoice = "official" | "tlauncher";
 
 type ImportAnalysis = {
   suggested_name: string;
@@ -1143,8 +1143,12 @@ function App() {
 
   useEffect(() => {
     const stored = window.localStorage.getItem("gho_launcher_choice");
-    if (stored === "official" || stored === "custom") {
+    if (stored === "official" || stored === "tlauncher") {
       setLauncherChoice(stored);
+      return;
+    }
+    if (stored === "custom") {
+      setLauncherChoice("tlauncher");
     }
   }, []);
 
@@ -1512,36 +1516,16 @@ function App() {
     }
   };
 
-  const resolveLauncherPath = async () => {
-    const base = await dataDir();
-    return join(base, ".minecraft", "launcher", "minecraft.exe");
-  };
-
   const launchMinecraft = async (choice: LauncherChoice) => {
-    if (choice === "custom") {
-      setUiToast({ tone: "success", message: "Open your launcher manually." });
-      return;
-    }
-
+    if (!isTauri) return;
     try {
-      await openUrl("minecraft://");
-      return;
-    } catch {
-      // Fall back to the installed launcher binary.
+      await invoke("launch_minecraft", {
+        choice,
+        version: selectedServer?.version ?? null
+      });
+    } catch (err) {
+      setUiToast({ tone: "error", message: String(err) });
     }
-
-    try {
-      const launcherPath = await resolveLauncherPath();
-      const existsLauncher = await exists(launcherPath);
-      if (existsLauncher) {
-        await openPath(launcherPath);
-        return;
-      }
-    } catch {
-      // Ignore and surface a toast.
-    }
-
-    setUiToast({ tone: "error", message: "Minecraft Launcher not found." });
   };
 
   const handleLaunchMinecraft = async () => {
@@ -2060,8 +2044,11 @@ function App() {
   const loaderMismatch = Boolean(
     selectedServer && clientStatus?.running && clientLoader !== serverLoader && serverLoader !== "none"
   );
+  const supportsMods = Boolean(
+    selectedServer && (selectedServer.server_type === "forge" || selectedServer.server_type === "fabric")
+  );
   const modMismatch = Boolean(
-    modSync?.mods?.some((entry) => entry.status !== "installed")
+    supportsMods && modSync?.mods?.some((entry) => entry.status !== "installed")
   );
   const isCompatible = Boolean(
     clientStatus?.running && serverReady && !versionMismatch && !loaderMismatch && !modMismatch
@@ -2149,6 +2136,27 @@ function App() {
       if (reports.length > 0) {
         setCrashModalOpen(true);
       }
+    } catch (err) {
+      setUiToast({ tone: "error", message: String(err) });
+    }
+  };
+
+  const handleExportCrashReports = async () => {
+    if (!isTauri) return;
+    if (crashReports.length === 0) {
+      setUiToast({ tone: "error", message: "No crash reports to export." });
+      return;
+    }
+    try {
+      const target = await save({
+        title: "Export crash reports",
+        defaultPath: "crash-reports.zip",
+        filters: [{ name: "Zip archive", extensions: ["zip"] }]
+      });
+      if (!target || Array.isArray(target)) return;
+      const path = await invoke<string>("export_crash_reports", { destination: target });
+      await openPath(path);
+      setUiToast({ tone: "success", message: "Crash reports exported." });
     } catch (err) {
       setUiToast({ tone: "error", message: String(err) });
     }
@@ -2447,22 +2455,6 @@ function App() {
                 </span>
                 {sidebarExpanded && <span>Games</span>}
               </button>
-              <button
-                className={classNames(
-                  "flex w-full items-center rounded-xl py-2 text-sm transition whitespace-nowrap",
-                  view === "settings" ? "bg-white/10 text-one" : "text-muted hover:bg-white/10",
-                  sidebarExpanded ? "px-3 gap-3" : "justify-center px-2 gap-0"
-                )}
-                onClick={() => setView("settings")}
-              >
-                <span className="flex h-8 w-8 items-center justify-center rounded-lg border border-white/10 text-one">
-                  <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
-                    <circle cx="12" cy="12" r="3" />
-                    <path d="M19.4 15a1.7 1.7 0 0 0 .33 1.82l.03.03a2 2 0 1 1-2.83 2.83l-.03-.03a1.7 1.7 0 0 0-1.82-.33 1.7 1.7 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.06a1.7 1.7 0 0 0-1-1.51 1.7 1.7 0 0 0-1.82.33l-.03.03a2 2 0 1 1-2.83-2.83l.03-.03a1.7 1.7 0 0 0 .33-1.82 1.7 1.7 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.06a1.7 1.7 0 0 0 1.51-1 1.7 1.7 0 0 0-.33-1.82l-.03-.03a2 2 0 1 1 2.83-2.83l.03.03a1.7 1.7 0 0 0 1.82.33 1.7 1.7 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.06a1.7 1.7 0 0 0 1 1.51 1.7 1.7 0 0 0 1.82-.33l.03-.03a2 2 0 1 1 2.83 2.83l-.03.03a1.7 1.7 0 0 0-.33 1.82 1.7 1.7 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.06a1.7 1.7 0 0 0-1.51 1z" />
-                  </svg>
-                </span>
-                {sidebarExpanded && <span>Settings</span>}
-              </button>
             </nav>
 
             {sidebarExpanded ? (
@@ -2521,6 +2513,26 @@ function App() {
                 </button>
               ))}
             </nav>
+
+            <div className={classNames("px-2", sidebarExpanded ? "pb-3" : "pb-2")}
+            >
+              <button
+                className={classNames(
+                  "flex w-full items-center rounded-xl py-2 text-sm transition whitespace-nowrap",
+                  view === "settings" ? "bg-white/10 text-one" : "text-muted hover:bg-white/10",
+                  sidebarExpanded ? "px-3 gap-3" : "justify-center px-2 gap-0"
+                )}
+                onClick={() => setView("settings")}
+              >
+                <span className="flex h-8 w-8 items-center justify-center rounded-lg border border-white/10 text-one">
+                  <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
+                    <circle cx="12" cy="12" r="3" />
+                    <path d="M19.4 15a1.7 1.7 0 0 0 .33 1.82l.03.03a2 2 0 1 1-2.83 2.83l-.03-.03a1.7 1.7 0 0 0-1.82-.33 1.7 1.7 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.06a1.7 1.7 0 0 0-1-1.51 1.7 1.7 0 0 0-1.82.33l-.03.03a2 2 0 1 1-2.83-2.83l.03-.03a1.7 1.7 0 0 0 .33-1.82 1.7 1.7 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.06a1.7 1.7 0 0 0 1.51-1 1.7 1.7 0 0 0-.33-1.82l-.03-.03a2 2 0 1 1 2.83-2.83l.03.03a1.7 1.7 0 0 0 1.82.33 1.7 1.7 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.06a1.7 1.7 0 0 0 1 1.51 1.7 1.7 0 0 0 1.82-.33l.03-.03a2 2 0 1 1 2.83 2.83l-.03.03a1.7 1.7 0 0 0-.33 1.82 1.7 1.7 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.06a1.7 1.7 0 0 0-1.51 1z" />
+                  </svg>
+                </span>
+                {sidebarExpanded && <span>Settings</span>}
+              </button>
+            </div>
 
             <div className="px-4 pb-5">
               <button
@@ -2842,8 +2854,8 @@ function App() {
                   <PrimaryButton onClick={() => handleChooseLauncher("official")}>
                     Official Minecraft Launcher
                   </PrimaryButton>
-                  <SubtleButton onClick={() => handleChooseLauncher("custom")}>
-                    TLauncher / custom (manual)
+                  <SubtleButton onClick={() => handleChooseLauncher("tlauncher")}>
+                    TLauncher
                   </SubtleButton>
                 </div>
               </div>
@@ -2961,9 +2973,12 @@ function App() {
                     )}
                     {crashReports.length > 0 && (
                       <div className="flex items-center justify-between">
-                        <SubtleButton onClick={clearCrashReports} className="text-danger">
-                          Clear all
-                        </SubtleButton>
+                        <div className="flex items-center gap-2">
+                          <SubtleButton onClick={handleExportCrashReports}>Export reports</SubtleButton>
+                          <SubtleButton onClick={clearCrashReports} className="text-danger">
+                            Clear all
+                          </SubtleButton>
+                        </div>
                       </div>
                     )}
                   </div>
@@ -3260,9 +3275,12 @@ function App() {
                       )}
                       {crashReports.length > 0 && (
                         <div className="flex items-center justify-end">
-                          <SubtleButton onClick={clearCrashReports} className="text-danger">
-                            Clear all
-                          </SubtleButton>
+                          <div className="flex items-center gap-2">
+                            <SubtleButton onClick={handleExportCrashReports}>Export reports</SubtleButton>
+                            <SubtleButton onClick={clearCrashReports} className="text-danger">
+                              Clear all
+                            </SubtleButton>
+                          </div>
                         </div>
                       )}
                     </div>
@@ -4062,7 +4080,7 @@ function App() {
                             Server requires {formatLoaderLabel(serverLoader)}, but your client is {formatLoaderLabel(clientLoader)}
                           </div>
                         )}
-                        {clientStatus?.running && modMismatch && (
+                        {clientStatus?.running && supportsMods && modMismatch && (
                           <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs text-amber-200">
                             <p>Mods do not match this server.</p>
                             <p>Sync required before joining.</p>
@@ -4092,7 +4110,7 @@ function App() {
                             <SubtleButton onClick={() => setCompatHelpOpen(true)}>How to fix</SubtleButton>
                           </div>
                         )}
-                        {modMismatch && (
+                        {supportsMods && modMismatch && (
                           <div className="flex flex-wrap items-center gap-2">
                             <PrimaryButton onClick={handleDownloadMissingMods} disabled={modSyncLoading}>
                               {modSyncLoading ? "Syncing..." : "Download missing mods"}
@@ -4100,52 +4118,53 @@ function App() {
                             <SubtleButton onClick={handleSyncModsCheck}>Sync mods with server</SubtleButton>
                           </div>
                         )}
-
-                        <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
-                          <div className="flex items-center justify-between gap-3">
-                            <p className="text-xs uppercase tracking-[0.2em] text-muted">Mod sync</p>
-                            <div className="flex items-center gap-2">
-                              <SubtleButton onClick={handleSyncModsCheck} disabled={modSyncLoading}>
-                                {modSyncLoading ? "Checking..." : "Check"}
-                              </SubtleButton>
-                              <SubtleButton onClick={openClientModsFolder}>Open mods folder</SubtleButton>
+                        {supportsMods && (
+                          <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
+                            <div className="flex items-center justify-between gap-3">
+                              <p className="text-xs uppercase tracking-[0.2em] text-muted">Mod sync</p>
+                              <div className="flex items-center gap-2">
+                                <SubtleButton onClick={handleSyncModsCheck} disabled={modSyncLoading}>
+                                  {modSyncLoading ? "Checking..." : "Check"}
+                                </SubtleButton>
+                                <SubtleButton onClick={openClientModsFolder}>Open mods folder</SubtleButton>
+                              </div>
                             </div>
-                          </div>
-                          {modpack && (
-                            <p className="mt-2 text-xs text-muted">
-                              Modpack: {modpack.mcVersion} · {formatLoaderLabel(modpack.loader)} · {modpack.mods.length} mods
-                            </p>
-                          )}
-                          {modSync?.mods && modSync.mods.length > 0 ? (
-                            <div className="mt-3 grid gap-2">
-                              {modSync.mods.map((entry) => (
-                                <div
-                                  key={entry.id}
-                                  className="flex items-center justify-between rounded-2xl border border-white/10 bg-white/5 px-3 py-2"
-                                >
-                                  <div>
-                                    <p className="text-sm text-text">{entry.id}</p>
-                                    <p className="text-xs text-muted">{entry.version}</p>
-                                  </div>
-                                  <span
-                                    className={classNames(
-                                      "rounded-full px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.2em]",
-                                      entry.status === "installed"
-                                        ? "bg-secondary/20 text-secondary"
-                                        : entry.status === "missing"
-                                        ? "bg-amber-500/20 text-amber-200"
-                                        : "bg-danger/20 text-danger"
-                                    )}
+                            {modpack && (
+                              <p className="mt-2 text-xs text-muted">
+                                Modpack: {modpack.mcVersion} · {formatLoaderLabel(modpack.loader)} · {modpack.mods.length} mods
+                              </p>
+                            )}
+                            {modSync?.mods && modSync.mods.length > 0 ? (
+                              <div className="mt-3 grid gap-2">
+                                {modSync.mods.map((entry) => (
+                                  <div
+                                    key={entry.id}
+                                    className="flex items-center justify-between rounded-2xl border border-white/10 bg-white/5 px-3 py-2"
                                   >
-                                    {entry.status}
-                                  </span>
-                                </div>
-                              ))}
-                            </div>
-                          ) : (
-                            <p className="mt-3 text-xs text-muted">No modpack data yet.</p>
-                          )}
-                        </div>
+                                    <div>
+                                      <p className="text-sm text-text">{entry.id}</p>
+                                      <p className="text-xs text-muted">{entry.version}</p>
+                                    </div>
+                                    <span
+                                      className={classNames(
+                                        "rounded-full px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.2em]",
+                                        entry.status === "installed"
+                                          ? "bg-secondary/20 text-secondary"
+                                          : entry.status === "missing"
+                                          ? "bg-amber-500/20 text-amber-200"
+                                          : "bg-danger/20 text-danger"
+                                      )}
+                                    >
+                                      {entry.status}
+                                    </span>
+                                  </div>
+                                ))}
+                              </div>
+                            ) : (
+                              <p className="mt-3 text-xs text-muted">No modpack data yet.</p>
+                            )}
+                          </div>
+                        )}
                       </div>
                     </Card>
                   </Tabs.Content>
