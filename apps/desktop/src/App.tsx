@@ -779,7 +779,6 @@ function App() {
   const emergencyBackupRef = useRef(false);
   const [tutorialActive, setTutorialActive] = useState(false);
   const [tutorialStepIndex, setTutorialStepIndex] = useState(0);
-  const [tutorialRect, setTutorialRect] = useState<DOMRect | null>(null);
   const [showTutorialOnStartup, setShowTutorialOnStartup] = useState(true);
   const [wizardVersionFilter, setWizardVersionFilter] = useState("");
   const [wizardForgeVersions, setWizardForgeVersions] = useState<string[]>([]);
@@ -1199,50 +1198,6 @@ function App() {
       .then((value) => setActiveServerId(value))
       .catch(() => {});
   }, [status]);
-
-  useEffect(() => {
-    if (!tutorialActive) {
-      setTutorialRect(null);
-      return;
-    }
-
-    const step = TUTORIAL_STEPS[tutorialStepIndex];
-    if (!step) return;
-
-    const updateRect = () => {
-      if (view !== step.view) {
-        setTutorialRect(null);
-        return;
-      }
-      if (step.tab && detailTab !== step.tab) {
-        setTutorialRect(null);
-        return;
-      }
-      const element = document.querySelector(step.selector);
-      if (element) {
-        const rect = element.getBoundingClientRect();
-        setTutorialRect(rect);
-      } else {
-        setTutorialRect(null);
-      }
-    };
-
-    updateRect();
-    const timer = setTimeout(updateRect, 200);
-    const poll = window.setInterval(() => {
-      const element = document.querySelector(step.selector);
-      if (element) {
-        updateRect();
-        window.clearInterval(poll);
-      }
-    }, 300);
-    window.addEventListener("resize", updateRect);
-    return () => {
-      clearTimeout(timer);
-      window.clearInterval(poll);
-      window.removeEventListener("resize", updateRect);
-    };
-  }, [tutorialActive, tutorialStepIndex, view, detailTab]);
 
   useEffect(() => {
     const initAppData = async () => {
@@ -2323,7 +2278,6 @@ function App() {
     }
     setTutorialActive(false);
     setTutorialStepIndex(0);
-    setTutorialRect(null);
     window.localStorage.setItem("gho_tutorial_done", "true");
   };
 
