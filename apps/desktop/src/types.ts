@@ -1,4 +1,4 @@
-export type View = "loading" | "welcome" | "library" | "servers" | "wizard" | "detail" | "settings";
+export type View = "loading" | "welcome" | "library" | "servers" | "wizard" | "migration" | "detail" | "settings";
 
 export type ServerStatus = "STOPPED" | "STARTING" | "RUNNING" | "ERROR";
 
@@ -41,7 +41,7 @@ export type ModpackManifest = {
 export type ModSyncEntry = {
   id: string;
   version: string;
-  status: "installed" | "missing" | "conflict";
+  status: "installed" | "missing" | "conflict" | "unknown";
 };
 
 export type ModSyncStatus = {
@@ -87,6 +87,57 @@ export type ImportAnalysis = {
   warnings: string[];
 };
 
+export type WorldImportMode = "generate" | "import";
+
+export type WorldSourceKind = "folder" | "zip";
+
+export type WorldValidationResult = {
+  valid: boolean;
+  source_kind: WorldSourceKind;
+  world_name: string;
+  world_path: string;
+  staged_path?: string | null;
+  size_bytes: number;
+  has_level_dat: boolean;
+  has_region: boolean;
+  has_playerdata: boolean;
+  has_data: boolean;
+  has_dim_nether: boolean;
+  has_dim_end: boolean;
+  detected_version?: string | null;
+  detected_type?: "vanilla" | "forge" | null;
+};
+
+export type WorldCopyProgress = {
+  server_name: string;
+  total_bytes: number;
+  copied_bytes: number;
+  percent: number;
+};
+
+export type WorldImportPayload = {
+  source_path: string;
+  source_kind: WorldSourceKind;
+  staged_path?: string | null;
+};
+
+export type ModsImportMode = "skip" | "zip" | "folder";
+
+export type ModsValidationResult = {
+  valid: boolean;
+  source_kind: WorldSourceKind;
+  mods_path: string;
+  staged_path?: string | null;
+  mod_count: number;
+  detected_pack?: "modrinth" | "curseforge" | null;
+};
+
+export type ModsImportPayload = {
+  source_path: string;
+  source_kind: WorldSourceKind;
+  staged_path?: string | null;
+};
+
 export type BackupEntry = {
   id: string;
   created_at: string;
@@ -101,10 +152,25 @@ export type MinecraftClientStatus = {
   pid?: number | null;
 };
 
+export type ClientVersionInfo = {
+  versionId: string;
+  mcVersion: string;
+  loader: string;
+};
+
+export type ClientDetectionResult = {
+  running: boolean;
+  versionId: string | null;
+  mcVersion: string | null;
+  loader: string | null;
+  pid: number | null;
+};
+
 export type AppSettings = {
   analytics_enabled: boolean;
   crash_reporting_enabled: boolean;
   analytics_endpoint?: string | null;
+  launcher_path?: string | null;
 };
 
 export type UpdateInfo = {
@@ -131,6 +197,15 @@ export type ServerMeta = {
   auto_backup: boolean;
   backup_interval_minutes: number;
   last_backup_at?: string | null;
+};
+
+export type ServerMetadata = {
+  loader: string;
+  mcVersion: string;
+  modCount: number;
+  moddedWorld: boolean;
+  modpack?: string | null;
+  detectedAt: string;
 };
 
 export type Difficulty = "Peaceful" | "Easy" | "Normal" | "Hard";

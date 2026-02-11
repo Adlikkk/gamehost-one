@@ -63,7 +63,7 @@ export function Sidebar({
         <button
           className={classNames(
             "flex w-full items-center gap-3 rounded-xl py-2 text-sm transition",
-            view === "servers" || view === "wizard" || view === "detail"
+            view === "servers" || view === "wizard" || view === "migration" || view === "detail"
               ? "bg-white/10 text-one"
               : "text-muted hover:bg-white/10",
             sidebarExpanded ? "px-3" : "justify-center px-2"
