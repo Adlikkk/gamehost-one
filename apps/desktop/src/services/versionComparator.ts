@@ -17,8 +17,6 @@ export function compareClientToServer(
     ? "forge"
     : server.server_type === "fabric"
     ? "fabric"
-    : server.server_type === "quilt"
-    ? "quilt"
     : "vanilla";
   const clientLoader = client.loader ?? "vanilla";
 
