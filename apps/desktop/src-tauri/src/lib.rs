@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use sysinfo::{Pid, System};
 use tauri::{AppHandle, Manager, State};
 use tauri::{Emitter, WindowEvent};
+use urlencoding::encode;
 use walkdir::WalkDir;
 use zip::{ZipArchive, ZipWriter, write::FileOptions};
 
@@ -1515,7 +1516,7 @@ fn launch_minecraft(choice: String, version: Option<String>) -> Result<(), Strin
         let normalized = choice.to_lowercase();
         if normalized == "official" {
             if let Some(version) = version.as_ref() {
-                let url = format!("minecraft://launch/?version={}", version);
+                let url = format!("minecraft://launch/?version={}", encode(version));
                 if try_open_protocol(&url).is_ok() {
                     return Ok(());
                 }
@@ -2045,8 +2046,16 @@ fn log_analytics_event(base: &Path, settings: &AppSettings, name: &str) {
 
     if let Some(endpoint) = settings.analytics_endpoint.as_deref() {
         if endpoint.starts_with("http") {
-            let client = reqwest::blocking::Client::new();
-            let _ = client.post(endpoint).json(&entry).send();
+            let endpoint = endpoint.to_string();
+            let entry = entry.clone();
+            std::thread::spawn(move || {
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(Duration::from_secs(2))
+                    .build();
+                if let Ok(client) = client {
+                    let _ = client.post(endpoint).json(&entry).send();
+                }
+            });
         }
     }
 }

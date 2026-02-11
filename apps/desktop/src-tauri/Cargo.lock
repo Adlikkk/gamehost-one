@@ -1247,7 +1247,7 @@ dependencies = [
 
 [[package]]
 name = "gamehostone"
-version = "0.2.0"
+version = "0.1.0"
 dependencies = [
  "chrono",
  "hex",
@@ -1267,6 +1267,7 @@ dependencies = [
  "tauri-plugin-notification",
  "tauri-plugin-opener",
  "toml 0.8.2",
+ "urlencoding",
  "walkdir",
  "windows 0.61.3",
  "zip",
@@ -5066,6 +5067,12 @@ dependencies = [
  "serde",
  "serde_derive",
 ]
+
+[[package]]
+name = "urlencoding"
+version = "2.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
 
 [[package]]
 name = "urlpattern"

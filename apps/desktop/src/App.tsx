@@ -14,156 +14,33 @@ import * as Switch from "@radix-ui/react-switch";
 import * as Select from "@radix-ui/react-select";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { BrandName } from "./components/BrandName";
+import type {
+  AppSettings,
+  ApplyResult,
+  BackupEntry,
+  CrashReport,
+  CrashReportSummary,
+  Difficulty,
+  GameMode,
+  ImportAnalysis,
+  JavaStatusResult,
+  LauncherChoice,
+  MinecraftClientStatus,
+  ModEntry,
+  ModpackManifest,
+  ModSyncStatus,
+  NetworkInfo,
+  ResourceUsage,
+  ServerConfig,
+  ServerMeta,
+  ServerSettings,
+  ServerStatus,
+  UpdateInfo,
+  VersionGroup,
+  View
+} from "./types";
 
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-
-type View = "loading" | "welcome" | "library" | "servers" | "wizard" | "detail" | "settings";
-
-type ServerStatus = "STOPPED" | "STARTING" | "RUNNING" | "ERROR";
-
-type ServerConfig = {
-  name: string;
-  server_type: "vanilla" | "paper" | "forge" | "fabric";
-  version: string;
-  ram_gb: number;
-  online_mode: boolean;
-  port: number;
-  server_dir: string;
-  linked?: boolean;
-};
-
-type ResourceUsage = {
-  cpu_percent: number;
-  memory_mb: number;
-  memory_limit_mb: number;
-};
-
-type ModEntry = {
-  name: string;
-  enabled: boolean;
-  file_name: string;
-};
-
-type ModpackEntry = {
-  id: string;
-  version: string;
-  sha256: string;
-  url: string;
-};
-
-type ModpackManifest = {
-  mcVersion: string;
-  loader: string;
-  mods: ModpackEntry[];
-};
-
-type ModSyncEntry = {
-  id: string;
-  version: string;
-  status: "installed" | "missing" | "conflict";
-};
-
-type ModSyncStatus = {
-  mcVersion: string;
-  loader: string;
-  mods: ModSyncEntry[];
-};
-
-type NetworkInfo = {
-  local_ip: string;
-  public_ip: string;
-  port_open: boolean;
-};
-
-type ApplyResult = {
-  applied: boolean;
-  pending_restart: boolean;
-};
-
-type JavaStatusResult = {
-  status: "ready" | "missing" | "unsupported";
-  required_major: number;
-  selected_path?: string | null;
-  selected_major?: number | null;
-  system_path?: string | null;
-  system_major?: number | null;
-  runtime_path?: string | null;
-  runtime_major?: number | null;
-};
-
-type LauncherChoice = "official" | "tlauncher";
-
-type ImportAnalysis = {
-  suggested_name: string;
-  server_type: ServerConfig["server_type"];
-  detected_version: string;
-  jar_path: string;
-  has_properties: boolean;
-  has_world: boolean;
-  has_nether: boolean;
-  has_end: boolean;
-  detected_ram_gb?: number | null;
-  warnings: string[];
-};
-
-type BackupEntry = {
-  id: string;
-  created_at: string;
-  size_bytes: number;
-  path: string;
-};
-
-type MinecraftClientStatus = {
-  running: boolean;
-  mcVersion?: string | null;
-  loader?: string | null;
-  pid?: number | null;
-};
-
-type AppSettings = {
-  analytics_enabled: boolean;
-  crash_reporting_enabled: boolean;
-  analytics_endpoint?: string | null;
-};
-
-type UpdateInfo = {
-  update_available: boolean;
-  latest_version?: string | null;
-  download_url?: string | null;
-};
-
-type CrashReportSummary = {
-  file_name: string;
-  timestamp: string;
-  message: string;
-};
-
-type CrashReport = {
-  timestamp: string;
-  app_version: string;
-  os: string;
-  message: string;
-  backtrace: string;
-};
-
-type ServerMeta = {
-  auto_backup: boolean;
-  backup_interval_minutes: number;
-  last_backup_at?: string | null;
-};
-
-type Difficulty = "Peaceful" | "Easy" | "Normal" | "Hard";
-
-type GameMode = "Survival" | "Creative" | "Adventure" | "Spectator";
-
-type ServerSettings = {
-  sleepPlayers: number;
-  difficulty: Difficulty;
-  gameMode: GameMode;
-  pvp: boolean;
-  maxPlayers: number;
-  viewDistance: number;
-};
 
 const SERVER_TYPES = [
   { value: "vanilla", label: "Vanilla" },
@@ -175,10 +52,6 @@ const IMPORT_SERVER_TYPES = [
   ...SERVER_TYPES,
   { value: "fabric", label: "Fabric" }
 ] as const;
-
-type VersionEntry = { value: string; label?: string; recommended?: boolean };
-
-type VersionGroup = { label: string; versions: VersionEntry[] };
 
 const VERSION_OPTIONS: Record<ServerConfig["server_type"], VersionGroup[]> = {
   vanilla: [

@@ -1,6 +1,6 @@
 [package]
 name = "gamehostone"
-version = "0.2.0"
+version = "0.1.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -36,6 +36,7 @@ zip = "0.6"
 walkdir = "2"
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
+urlencoding = "2"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61.3", features = ["Win32_Graphics_Dwm", "Win32_Foundation"] }
