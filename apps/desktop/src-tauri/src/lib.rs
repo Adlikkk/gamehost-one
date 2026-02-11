@@ -8,8 +8,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+use fastnbt::from_bytes;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use base64::{engine::general_purpose, Engine as _};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use sysinfo::{Pid, System};
@@ -81,6 +84,66 @@ struct ServerConfigInput {
     #[serde(rename = "online_mode", alias = "onlineMode")]
     online_mode: bool,
     port: u16,
+    #[serde(default, rename = "world_import", alias = "worldImport")]
+    world_import: Option<WorldImportInput>,
+    #[serde(default, rename = "mod_import", alias = "modImport")]
+    mod_import: Option<ModsImportInput>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorldImportInput {
+    #[serde(rename = "source_path", alias = "sourcePath")]
+    source_path: String,
+    #[serde(rename = "source_kind", alias = "sourceKind")]
+    source_kind: String,
+    #[serde(rename = "staged_path", alias = "stagedPath")]
+    staged_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModsImportInput {
+    #[serde(rename = "source_path", alias = "sourcePath")]
+    source_path: String,
+    #[serde(rename = "source_kind", alias = "sourceKind")]
+    source_kind: String,
+    #[serde(rename = "staged_path", alias = "stagedPath")]
+    staged_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorldValidationResult {
+    valid: bool,
+    source_kind: String,
+    world_name: String,
+    world_path: String,
+    staged_path: Option<String>,
+    size_bytes: u64,
+    has_level_dat: bool,
+    has_region: bool,
+    has_playerdata: bool,
+    has_data: bool,
+    has_dim_nether: bool,
+    has_dim_end: bool,
+    detected_version: Option<String>,
+    detected_type: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ModsValidationResult {
+    valid: bool,
+    source_kind: String,
+    mods_path: String,
+    staged_path: Option<String>,
+    mod_count: usize,
+    detected_pack: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct WorldCopyProgress {
+    server_name: String,
+    total_bytes: u64,
+    copied_bytes: u64,
+    percent: u8,
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,6 +179,20 @@ struct ServerMeta {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
+struct ServerMetadata {
+    loader: String,
+    #[serde(rename = "mcVersion")]
+    mc_version: String,
+    #[serde(rename = "modCount")]
+    mod_count: usize,
+    #[serde(rename = "moddedWorld")]
+    modded_world: bool,
+    modpack: Option<String>,
+    #[serde(rename = "detectedAt")]
+    detected_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 struct JavaConfig {
     java_path: Option<String>,
 }
@@ -125,6 +202,7 @@ struct AppSettings {
     analytics_enabled: bool,
     crash_reporting_enabled: bool,
     analytics_endpoint: Option<String>,
+    launcher_path: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -133,6 +211,7 @@ impl Default for AppSettings {
             analytics_enabled: false,
             crash_reporting_enabled: false,
             analytics_endpoint: None,
+            launcher_path: None,
         }
     }
 }
@@ -242,6 +321,46 @@ struct ModpackManifest {
     mods: Vec<ModpackEntry>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CurseForgeManifest {
+    minecraft: CurseForgeMinecraft,
+    files: Vec<CurseForgeFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CurseForgeMinecraft {
+    version: String,
+    #[serde(rename = "modLoaders")]
+    mod_loaders: Vec<CurseForgeModLoader>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CurseForgeModLoader {
+    id: String,
+    primary: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct CurseForgeFile {
+    #[serde(rename = "projectID")]
+    project_id: u64,
+    #[serde(rename = "fileID")]
+    file_id: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModrinthIndex {
+    dependencies: std::collections::HashMap<String, String>,
+    files: Vec<ModrinthFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModrinthFile {
+    path: String,
+    hashes: std::collections::HashMap<String, String>,
+    downloads: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct ModSyncEntry {
     id: String,
@@ -264,6 +383,15 @@ struct MinecraftClientStatus {
     mc_version: Option<String>,
     loader: Option<String>,
     pid: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct ClientVersionInfo {
+    #[serde(rename = "versionId")]
+    version_id: String,
+    #[serde(rename = "mcVersion")]
+    mc_version: String,
+    loader: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -480,7 +608,7 @@ fn get_server_config(state: State<AppState>) -> Result<ServerConfig, String> {
 }
 
 #[tauri::command]
-fn create_server(config: ServerConfigInput, state: State<AppState>) -> Result<ServerConfig, String> {
+fn create_server(config: ServerConfigInput, state: State<AppState>, app: AppHandle) -> Result<ServerConfig, String> {
     let mut registry = load_registry(&state.registry_path, &state.legacy_config_path)?;
     let server_name = sanitize_name(&config.name);
     if registry
@@ -491,7 +619,7 @@ fn create_server(config: ServerConfigInput, state: State<AppState>) -> Result<Se
         return Err("Server name is already in use".to_string());
     }
 
-    let server_dir = state.data_dir.join("servers").join(server_name);
+    let server_dir = state.data_dir.join("servers").join(&server_name);
     fs::create_dir_all(&server_dir).map_err(|err| err.to_string())?;
 
     let java_exe = if matches!(config.server_type, ServerType::Forge) {
@@ -502,6 +630,17 @@ fn create_server(config: ServerConfigInput, state: State<AppState>) -> Result<Se
     let launcher = install_server(&config, &server_dir, java_exe.as_deref())?;
     write_server_properties(&server_dir, config.port, config.online_mode)?;
     write_eula(&server_dir)?;
+
+    if let Some(world_import) = &config.world_import {
+        import_world_into_server(&server_dir, &server_name, world_import, &state, &app)?;
+    }
+    if let Some(mods_import) = &config.mod_import {
+        import_mods_into_server(&server_dir, mods_import, &state)?;
+    }
+
+    if let Ok(metadata) = scan_server_metadata(&server_dir) {
+        let _ = save_server_metadata(&server_dir, &metadata);
+    }
 
     let final_config = ServerConfig {
         name: config.name,
@@ -882,6 +1021,8 @@ fn reinstall_server(
         ram_gb,
         online_mode,
         port,
+        world_import: None,
+        mod_import: None,
     };
 
     let java_exe = if matches!(server_type, ServerType::Forge) {
@@ -979,6 +1120,9 @@ fn import_server(request: ImportRequest, state: State<AppState>, app: AppHandle)
 
     registry.servers.push(final_config.clone());
     save_registry(&state.registry_path, &registry)?;
+    if let Ok(metadata) = scan_server_metadata(&target_dir) {
+        let _ = save_server_metadata(&target_dir, &metadata);
+    }
     let settings = load_app_settings(&state.data_dir);
     log_analytics_event(&state.data_dir, &settings, "server_created");
     append_log(&state.data_dir, &format!("Imported server: {}", final_config.name));
@@ -989,6 +1133,20 @@ fn import_server(request: ImportRequest, state: State<AppState>, app: AppHandle)
 #[tauri::command]
 fn get_server_meta(server_id: String, state: State<AppState>) -> Result<ServerMeta, String> {
     load_server_meta(&state.data_dir, &server_id)
+}
+
+#[tauri::command]
+fn get_server_metadata(server_id: String, state: State<AppState>) -> Result<Option<ServerMetadata>, String> {
+    let server_dir = resolve_server_dir(&state, &server_id)?;
+    Ok(load_server_metadata(&server_dir))
+}
+
+#[tauri::command]
+fn detect_server_metadata(server_id: String, state: State<AppState>) -> Result<ServerMetadata, String> {
+    let server_dir = resolve_server_dir(&state, &server_id)?;
+    let metadata = scan_server_metadata(&server_dir)?;
+    let _ = save_server_metadata(&server_dir, &metadata);
+    Ok(metadata)
 }
 
 #[tauri::command]
@@ -1196,9 +1354,29 @@ fn get_forge_versions() -> Result<Vec<String>, String> {
         return Err("No Forge versions found".to_string());
     }
 
-    versions.sort();
-    versions.reverse();
+    versions.sort_by(|a, b| parse_forge_version(b).cmp(&parse_forge_version(a)));
     Ok(versions)
+}
+
+fn parse_forge_version(value: &str) -> (u32, u32, u32, u32) {
+    let mut mc_major = 0u32;
+    let mut mc_minor = 0u32;
+    let mut mc_patch = 0u32;
+    let mut forge_build = 0u32;
+
+    let mut parts = value.split('-');
+    if let Some(mc) = parts.next() {
+        let mut mc_parts = mc.split('.');
+        mc_major = mc_parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        mc_minor = mc_parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        mc_patch = mc_parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    }
+    if let Some(build) = parts.next() {
+        let mut build_parts = build.split('.');
+        forge_build = build_parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    }
+
+    (mc_major, mc_minor, mc_patch, forge_build)
 }
 
 #[tauri::command]
@@ -1304,6 +1482,7 @@ fn check_mod_sync(server_id: String, state: State<AppState>) -> Result<ModSyncSt
     let mods_dir = client_mods_dir().unwrap_or_else(|_| PathBuf::from(""));
     let mut client_hashes = Vec::new();
     let mut client_files = Vec::new();
+    let mut has_client_mods = false;
     if mods_dir.exists() {
         for entry in fs::read_dir(&mods_dir).map_err(|err| err.to_string())? {
             let entry = entry.map_err(|err| err.to_string())?;
@@ -1315,6 +1494,7 @@ fn check_mod_sync(server_id: String, state: State<AppState>) -> Result<ModSyncSt
             if !file_name.ends_with(".jar") {
                 continue;
             }
+            has_client_mods = true;
             if let Ok(hash) = sha256_file(&path) {
                 client_hashes.push(hash);
                 client_files.push(file_name.to_lowercase());
@@ -1324,7 +1504,11 @@ fn check_mod_sync(server_id: String, state: State<AppState>) -> Result<ModSyncSt
 
     let mut mods = Vec::new();
     for entry in manifest.mods.iter() {
-        let mut status = "missing".to_string();
+        let mut status = if !has_client_mods || entry.url.trim().is_empty() {
+            "unknown".to_string()
+        } else {
+            "missing".to_string()
+        };
         if client_hashes.iter().any(|hash| hash == &entry.sha256) {
             status = "installed".to_string();
         } else if client_files.iter().any(|name| name.contains(&entry.id.to_lowercase())) {
@@ -1369,11 +1553,15 @@ fn download_mods(
         Vec::new()
     };
 
+    let mut downloaded = 0usize;
     for entry in manifest.mods.iter() {
         if !target_ids.is_empty() && !target_ids.contains(&entry.id.to_lowercase()) {
             continue;
         }
         if client_hashes.iter().any(|hash| hash == &entry.sha256) {
+            continue;
+        }
+        if entry.url.trim().is_empty() {
             continue;
         }
         is_allowed_mod_url(&entry.url)?;
@@ -1384,6 +1572,11 @@ fn download_mods(
         }
         let client = reqwest::blocking::Client::new();
         download_with_sha256(&client, &entry.url, &entry.sha256, &destination)?;
+        downloaded += 1;
+    }
+
+    if !target_ids.is_empty() && downloaded == 0 {
+        return Err("Modpack entries do not include downloadable URLs.".to_string());
     }
 
     Ok(())
@@ -1440,6 +1633,15 @@ fn detect_minecraft_client() -> Result<MinecraftClientStatus, String> {
         });
     }
 
+    if let Some((mc_version, loader)) = parse_latest_log() {
+        return Ok(MinecraftClientStatus {
+            running: false,
+            mc_version: Some(mc_version),
+            loader: Some(loader),
+            pid: None,
+        });
+    }
+
     Ok(MinecraftClientStatus {
         running: false,
         mc_version: None,
@@ -1464,6 +1666,7 @@ fn candidate_paths_for_launcher(choice: &str) -> Vec<PathBuf> {
     let program_files_x86 = std::env::var("PROGRAMFILES(X86)").ok();
     let local_appdata = std::env::var("LOCALAPPDATA").ok();
     let appdata = std::env::var("APPDATA").ok();
+    let system_drive = std::env::var("SYSTEMDRIVE").ok();
 
     match choice {
         "official" => {
@@ -1474,10 +1677,24 @@ fn candidate_paths_for_launcher(choice: &str) -> Vec<PathBuf> {
                 paths.push(PathBuf::from(base).join("Minecraft Launcher").join("MinecraftLauncher.exe"));
             }
             if let Some(base) = local_appdata.as_ref() {
-                paths.push(PathBuf::from(base).join("Microsoft").join("WindowsApps").join("MinecraftLauncher.exe"));
+                paths.push(
+                    PathBuf::from(base)
+                        .join("Programs")
+                        .join("Minecraft Launcher")
+                        .join("MinecraftLauncher.exe"),
+                );
             }
             if let Some(base) = appdata.as_ref() {
                 paths.push(PathBuf::from(base).join(".minecraft").join("launcher").join("minecraft.exe"));
+            }
+            if let Some(base) = system_drive.as_ref() {
+                paths.push(
+                    PathBuf::from(base)
+                        .join("XboxGames")
+                        .join("Minecraft Launcher")
+                        .join("Content")
+                        .join("Minecraft.exe"),
+                );
             }
         }
         "tlauncher" => {
@@ -1502,33 +1719,91 @@ fn candidate_paths_for_launcher(choice: &str) -> Vec<PathBuf> {
 }
 
 #[cfg(target_os = "windows")]
-fn spawn_launcher(path: &Path) -> Result<(), String> {
+fn try_spawn_launcher(path: &Path) -> Result<(), String> {
     Command::new(path)
         .spawn()
         .map(|_| ())
         .map_err(|err| err.to_string())
 }
 
+#[cfg(target_os = "windows")]
+fn try_spawn_custom_launcher(path: &str) -> Result<(), String> {
+    let exe = PathBuf::from(path);
+    if !exe.exists() {
+        return Err("Launcher path not found".to_string());
+    }
+    try_spawn_launcher(&exe)
+}
+
+#[cfg(target_os = "windows")]
+fn try_launch_official_appx() -> Result<(), String> {
+    let app_ids = [
+        "shell:AppsFolder\\Microsoft.4297127D64EC6_8wekyb3d8bbwe!MinecraftLauncher",
+        "shell:AppsFolder\\Microsoft.4297127D64EC6_8wekyb3d8bbwe!Minecraft",
+    ];
+    for app_id in app_ids {
+        if Command::new("cmd")
+            .args(["/C", "start", "", app_id])
+            .spawn()
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+    Err("Unable to launch Minecraft from AppsFolder.".to_string())
+}
+
 #[tauri::command]
-fn launch_minecraft(choice: String, version: Option<String>) -> Result<(), String> {
+fn launch_minecraft(
+    choice: String,
+    version: Option<String>,
+    server_name: Option<String>,
+    state: State<AppState>,
+) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         let normalized = choice.to_lowercase();
+        let settings = load_app_settings(&state.data_dir);
+        if let Some(path) = settings.launcher_path.as_deref() {
+            if try_spawn_custom_launcher(path).is_ok() {
+                return Ok(());
+            }
+        }
         if normalized == "official" {
             if let Some(version) = version.as_ref() {
-                let url = format!("minecraft://launch/?version={}", encode(version));
-                if try_open_protocol(&url).is_ok() {
-                    return Ok(());
-                }
+                let _ = ensure_launcher_profile(version, server_name.as_deref());
             }
-            if try_open_protocol("minecraft://").is_ok() {
+        }
+        let candidates = candidate_paths_for_launcher(&normalized);
+        for path in candidates {
+            if !path.exists() {
+                continue;
+            }
+            if try_spawn_launcher(&path).is_ok() {
                 return Ok(());
             }
         }
 
-        for path in candidate_paths_for_launcher(&normalized) {
-            if path.exists() {
-                return spawn_launcher(&path);
+        if normalized == "official" {
+            if try_launch_official_appx().is_ok() {
+                return Ok(());
+            }
+            if let Some(version) = version.as_ref() {
+                if let Ok(profile_name) = ensure_launcher_profile(version, server_name.as_deref()) {
+                    let url = format!("minecraft://launch/?launchProfile={}", encode(&profile_name));
+                    if try_open_protocol(&url).is_ok() {
+                        return Ok(());
+                    }
+                }
+                if client_version_installed(version) {
+                    let url = format!("minecraft://launch/?version={}", encode(version));
+                    if try_open_protocol(&url).is_ok() {
+                        return Ok(());
+                    }
+                }
+            }
+            if try_open_protocol("minecraft://").is_ok() {
+                return Ok(());
             }
         }
 
@@ -2072,6 +2347,10 @@ fn server_meta_path(base: &Path, server_name: &str) -> PathBuf {
     base.join("configs").join(format!("{}_meta.json", sanitize_name(server_name)))
 }
 
+fn server_metadata_path(server_dir: &Path) -> PathBuf {
+    server_dir.join("metadata.json")
+}
+
 fn backups_root(base: &Path, server_name: &str) -> PathBuf {
     base.join("backups").join(sanitize_name(server_name))
 }
@@ -2100,6 +2379,181 @@ fn minecraft_dir() -> Result<PathBuf, String> {
     }
     let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
     Ok(PathBuf::from(home).join(".minecraft"))
+}
+
+fn client_version_installed(version: &str) -> bool {
+    let Ok(root) = minecraft_dir() else { return false };
+    let version_dir = root.join("versions").join(version);
+    if !version_dir.exists() {
+        return false;
+    }
+    version_dir.join(format!("{}.json", version)).exists()
+        || version_dir.join(format!("{}.jar", version)).exists()
+}
+
+fn extract_mc_version(value: &str) -> Option<String> {
+    let re = Regex::new(r"(\d+\.\d+(?:\.\d+)?)").ok()?;
+    re.captures(value)
+        .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
+}
+
+fn parse_client_version_info(version_id: &str) -> Result<Option<ClientVersionInfo>, String> {
+    if !client_version_installed(version_id) {
+        return Ok(None);
+    }
+    let root = minecraft_dir()?;
+    let version_path = root.join("versions").join(version_id).join(format!("{}.json", version_id));
+    if !version_path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(version_path).map_err(|err| err.to_string())?;
+    let value = serde_json::from_str::<serde_json::Value>(&content).map_err(|err| err.to_string())?;
+
+    let id = value
+        .get("id")
+        .and_then(|val| val.as_str())
+        .unwrap_or(version_id)
+        .to_string();
+    let inherits_from = value
+        .get("inheritsFrom")
+        .and_then(|val| val.as_str())
+        .map(|val| val.to_string());
+    let mc_version = inherits_from
+        .clone()
+        .or_else(|| extract_mc_version(&id))
+        .unwrap_or_else(|| id.clone());
+
+    let mut loader = "vanilla".to_string();
+    let id_lower = id.to_lowercase();
+    if id_lower.contains("forge") || id_lower.contains("fml") {
+        loader = "forge".to_string();
+    } else if id_lower.contains("fabric") {
+        loader = "fabric".to_string();
+    } else if id_lower.contains("quilt") {
+        loader = "quilt".to_string();
+    } else if let Some(libraries) = value.get("libraries").and_then(|val| val.as_array()) {
+        for library in libraries {
+            let name = library.get("name").and_then(|val| val.as_str()).unwrap_or("");
+            let lower = name.to_lowercase();
+            if lower.contains("net.minecraftforge") || lower.contains("forge") {
+                loader = "forge".to_string();
+                break;
+            }
+            if lower.contains("net.fabricmc") || lower.contains("fabric") {
+                loader = "fabric".to_string();
+                break;
+            }
+            if lower.contains("org.quiltmc") || lower.contains("quilt") {
+                loader = "quilt".to_string();
+                break;
+            }
+        }
+    }
+
+    Ok(Some(ClientVersionInfo {
+        version_id: id,
+        mc_version,
+        loader,
+    }))
+}
+
+#[tauri::command]
+fn get_client_version_info(version_id: String) -> Result<Option<ClientVersionInfo>, String> {
+    parse_client_version_info(&version_id)
+}
+
+fn launcher_profiles_path() -> Result<PathBuf, String> {
+    Ok(minecraft_dir()?.join("launcher_profiles.json"))
+}
+
+fn latest_log_path() -> Option<PathBuf> {
+    let root = minecraft_dir().ok()?;
+    Some(root.join("logs").join("latest.log"))
+}
+
+fn parse_latest_log() -> Option<(String, String)> {
+    let path = latest_log_path()?;
+    let content = fs::read_to_string(path).ok()?;
+    let mut version: Option<String> = None;
+    let mut loader = "vanilla".to_string();
+    let version_re = Regex::new(r"Minecraft\s+(\d+\.\d+(?:\.\d+)?)").ok()?;
+    for line in content.lines() {
+        if version.is_none() {
+            if let Some(caps) = version_re.captures(line) {
+                if let Some(value) = caps.get(1) {
+                    version = Some(value.as_str().to_string());
+                }
+            }
+        }
+        let lower = line.to_lowercase();
+        if lower.contains("forge") || lower.contains("modlauncher") {
+            loader = "forge".to_string();
+        } else if lower.contains("fabric") {
+            loader = "fabric".to_string();
+        } else if lower.contains("quilt") {
+            loader = "quilt".to_string();
+        }
+        if version.is_some() && loader != "vanilla" {
+            break;
+        }
+    }
+    version.map(|value| (value, loader))
+}
+
+#[cfg(target_os = "windows")]
+const GAMEHOST_ICON_PNG: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../public/logo.png"));
+
+fn ensure_launcher_profile(version: &str, server_name: Option<&str>) -> Result<String, String> {
+    if !client_version_installed(version) {
+        return Err("Client version is not installed".to_string());
+    }
+    let path = launcher_profiles_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+
+    let profile_name = server_name
+        .map(|name| format!("GameHost ONE - {}", name))
+        .unwrap_or_else(|| format!("GameHost ONE - {}", version));
+
+    let mut root = if path.exists() {
+        let content = fs::read_to_string(&path).map_err(|err| err.to_string())?;
+        serde_json::from_str::<serde_json::Value>(&content).unwrap_or_else(|_| json!({}))
+    } else {
+        json!({})
+    };
+
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    if root.get("profiles").is_none() {
+        root["profiles"] = json!({});
+    }
+    let profiles = root
+        .get_mut("profiles")
+        .and_then(|value| value.as_object_mut())
+        .ok_or("Unable to access launcher profiles")?;
+
+    let icon_data = format!("data:image/png;base64,{}", general_purpose::STANDARD.encode(GAMEHOST_ICON_PNG));
+    let entry = profiles.entry(profile_name.clone()).or_insert_with(|| {
+        json!({
+            "name": profile_name,
+            "type": "custom",
+            "created": now,
+            "lastUsed": now,
+            "icon": icon_data,
+            "lastVersionId": version
+        })
+    });
+
+    if let Some(obj) = entry.as_object_mut() {
+        obj.insert("lastVersionId".to_string(), json!(version));
+        obj.insert("lastUsed".to_string(), json!(now));
+        obj.insert("icon".to_string(), json!(icon_data));
+    }
+
+    root["selectedProfile"] = json!(profile_name.clone());
+    let payload = serde_json::to_string_pretty(&root).map_err(|err| err.to_string())?;
+    fs::write(path, payload).map_err(|err| err.to_string())?;
+    Ok(profile_name)
 }
 
 fn client_mods_dir() -> Result<PathBuf, String> {
@@ -2228,6 +2682,21 @@ fn save_server_meta(base: &Path, server_name: &str, meta: &ServerMeta) -> Result
     fs::write(path, content).map_err(|err| err.to_string())
 }
 
+fn load_server_metadata(server_dir: &Path) -> Option<ServerMetadata> {
+    let path = server_metadata_path(server_dir);
+    if !path.exists() {
+        return None;
+    }
+    let content = fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn save_server_metadata(server_dir: &Path, metadata: &ServerMetadata) -> Result<(), String> {
+    let path = server_metadata_path(server_dir);
+    let content = serde_json::to_string_pretty(metadata).map_err(|err| err.to_string())?;
+    fs::write(path, content).map_err(|err| err.to_string())
+}
+
 fn load_modpack(server_dir: &Path, config: &ServerConfig) -> Result<ModpackManifest, String> {
     let path = modpack_path(server_dir);
     if path.exists() {
@@ -2239,7 +2708,18 @@ fn load_modpack(server_dir: &Path, config: &ServerConfig) -> Result<ModpackManif
         });
         manifest.mc_version = config.version.clone();
         manifest.loader = server_loader_label(&config.server_type);
+        if manifest.mods.is_empty() {
+            if let Some(fallback) = build_modpack_from_server_mods(server_dir, config)? {
+                save_modpack(server_dir, &fallback)?;
+                return Ok(fallback);
+            }
+        }
         return Ok(manifest);
+    }
+
+    if let Some(fallback) = build_modpack_from_server_mods(server_dir, config)? {
+        save_modpack(server_dir, &fallback)?;
+        return Ok(fallback);
     }
 
     Ok(ModpackManifest {
@@ -2253,6 +2733,47 @@ fn save_modpack(server_dir: &Path, manifest: &ModpackManifest) -> Result<(), Str
     let path = modpack_path(server_dir);
     let content = serde_json::to_string_pretty(manifest).map_err(|err| err.to_string())?;
     fs::write(path, content).map_err(|err| err.to_string())
+}
+
+fn build_modpack_from_server_mods(
+    server_dir: &Path,
+    config: &ServerConfig,
+) -> Result<Option<ModpackManifest>, String> {
+    let mods_dir = server_dir.join("mods");
+    if !mods_dir.exists() {
+        return Ok(None);
+    }
+
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(&mods_dir).map_err(|err| err.to_string())? {
+        let entry = entry.map_err(|err| err.to_string())?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jar") {
+            continue;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("mod");
+        let id = file_name.trim_end_matches(".jar").to_string();
+        let sha256 = sha256_file(&path)?;
+        entries.push(ModpackEntry {
+            id,
+            version: "unknown".to_string(),
+            sha256,
+            url: String::new(),
+        });
+    }
+
+    if entries.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(ModpackManifest {
+        mc_version: config.version.clone(),
+        loader: server_loader_label(&config.server_type),
+        mods: entries,
+    }))
 }
 
 fn load_backup_manifest(base: &Path, server_name: &str) -> Result<Vec<BackupEntry>, String> {
@@ -2402,10 +2923,192 @@ fn detect_server_type(server_dir: &Path, jar_path: &Path) -> ServerType {
     ServerType::Vanilla
 }
 
+fn list_root_jars(server_dir: &Path) -> Vec<PathBuf> {
+    fs::read_dir(server_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("jar"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn detect_loader(server_dir: &Path) -> String {
+    let jars = list_root_jars(server_dir);
+    let has_quilt_jar = jars.iter().any(|path| {
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .map(|name| name.to_lowercase().starts_with("quilt-server-launch"))
+            .unwrap_or(false)
+    });
+    let has_fabric_jar = jars.iter().any(|path| {
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .map(|name| name.to_lowercase().starts_with("fabric-server-launch"))
+            .unwrap_or(false)
+    });
+    let has_forge_jar = jars.iter().any(|path| {
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .map(|name| name.to_lowercase().starts_with("forge-") || name.to_lowercase().contains("forge"))
+            .unwrap_or(false)
+    });
+    let has_vanilla_jar = jars.iter().any(|path| {
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .map(|name| name.to_lowercase().starts_with("minecraft_server"))
+            .unwrap_or(false)
+    });
+
+    let libraries = server_dir.join("libraries");
+    let has_quilt_lib = libraries.join("org").join("quiltmc").exists();
+    let has_fabric_lib = libraries.join("net").join("fabricmc").exists()
+        || libraries.join("net").join("fabric-loader").exists();
+    let has_forge_lib = libraries.join("net").join("minecraftforge").exists();
+
+    if has_quilt_jar || has_quilt_lib {
+        return "quilt".to_string();
+    }
+    if has_fabric_jar || has_fabric_lib {
+        return "fabric".to_string();
+    }
+    if has_forge_jar || has_forge_lib {
+        return "forge".to_string();
+    }
+    if has_vanilla_jar {
+        return "vanilla".to_string();
+    }
+    "unknown".to_string()
+}
+
 fn guess_version_from_name(name: &str) -> Option<String> {
     let re = Regex::new(r"(\d+\.\d+(?:\.\d+)?)").ok()?;
     let caps = re.captures(name)?;
     caps.get(1).map(|m| m.as_str().to_string())
+}
+
+fn read_version_from_json(path: &Path) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+    if let Some(id) = value.get("id").and_then(|v| v.as_str()) {
+        return Some(id.to_string());
+    }
+    if let Some(id) = value.get("name").and_then(|v| v.as_str()) {
+        return Some(id.to_string());
+    }
+    if let Some(id) = value.get("minecraft").and_then(|v| v.as_str()) {
+        return Some(id.to_string());
+    }
+    if let Some(info) = value.get("versionInfo") {
+        if let Some(id) = info.get("minecraftVersion").and_then(|v| v.as_str()) {
+            return Some(id.to_string());
+        }
+        if let Some(id) = info.get("id").and_then(|v| v.as_str()) {
+            return Some(id.to_string());
+        }
+    }
+    None
+}
+
+fn detect_version_from_json(server_dir: &Path) -> Option<String> {
+    let direct = server_dir.join("version.json");
+    if direct.exists() {
+        if let Some(version) = read_version_from_json(&direct) {
+            return Some(version);
+        }
+    }
+
+    let versions_dir = server_dir.join("versions");
+    if versions_dir.is_dir() {
+        if let Ok(entries) = fs::read_dir(&versions_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let json_path = path.join("version.json");
+                    if json_path.exists() {
+                        if let Some(version) = read_version_from_json(&json_path) {
+                            return Some(version);
+                        }
+                    }
+                } else if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                    if let Some(version) = read_version_from_json(&path) {
+                        return Some(version);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn detect_version_from_install_profile(server_dir: &Path) -> Option<String> {
+    let profile = server_dir.join("install_profile.json");
+    if profile.exists() {
+        if let Some(version) = read_version_from_json(&profile) {
+            return Some(version);
+        }
+    }
+    None
+}
+
+fn detect_version_from_level_dat(server_dir: &Path) -> Option<String> {
+    let world_dir = server_dir.join("world");
+    if !world_dir.exists() {
+        return None;
+    }
+    let (version, _) = read_level_dat(&world_dir).unwrap_or((None, false));
+    version
+}
+
+fn detect_server_version(server_dir: &Path) -> Option<String> {
+    let jars = list_root_jars(server_dir);
+    for jar in &jars {
+        if let Some(name) = jar.file_name().and_then(|s| s.to_str()) {
+            if let Some(version) = guess_version_from_name(name) {
+                return Some(version);
+            }
+        }
+    }
+    detect_version_from_json(server_dir)
+        .or_else(|| detect_version_from_install_profile(server_dir))
+        .or_else(|| detect_version_from_level_dat(server_dir))
+}
+
+fn detect_mod_count(server_dir: &Path) -> usize {
+    let mods_dir = server_dir.join("mods");
+    if !mods_dir.exists() {
+        return 0;
+    }
+    count_mods(&mods_dir)
+}
+
+fn detect_modded_world(server_dir: &Path) -> bool {
+    let world_dir = server_dir.join("world");
+    if !world_dir.exists() {
+        return false;
+    }
+    let (_, detected_type) = detect_world_metadata(&world_dir);
+    detected_type.is_some()
+}
+
+fn scan_server_metadata(server_dir: &Path) -> Result<ServerMetadata, String> {
+    let loader = detect_loader(server_dir);
+    let mc_version = detect_server_version(server_dir).unwrap_or_else(|| "unknown".to_string());
+    let mod_count = detect_mod_count(server_dir);
+    let modded_world = detect_modded_world(server_dir);
+    let modpack = detect_modpack_type(server_dir);
+    let detected_at = Utc::now().to_rfc3339();
+
+    Ok(ServerMetadata {
+        loader,
+        mc_version,
+        mod_count,
+        modded_world,
+        modpack,
+        detected_at,
+    })
 }
 
 fn parse_ram_from_args(text: &str) -> Option<u8> {
@@ -2630,8 +3333,7 @@ fn analyze_server_folder(path: &Path) -> Result<ImportAnalysis, String> {
 
     let jar_path = find_server_jar(path).ok_or("No server jar found")?;
     let server_type = detect_server_type(path, &jar_path);
-    let jar_name = jar_path.file_name().and_then(|s| s.to_str()).unwrap_or("server.jar");
-    let detected_version = guess_version_from_name(jar_name).unwrap_or_else(|| "unknown".to_string());
+    let detected_version = detect_server_version(path).unwrap_or_else(|| "unknown".to_string());
 
     let has_properties = path.join("server.properties").exists();
     let has_world = path.join("world").exists();
@@ -2675,6 +3377,665 @@ fn analyze_server_folder(path: &Path) -> Result<ImportAnalysis, String> {
         has_end,
         detected_ram_gb,
         warnings,
+    })
+}
+
+#[derive(Debug)]
+struct WorldValidationDetails {
+    world_root: PathBuf,
+    has_playerdata: bool,
+    has_data: bool,
+    has_dim_nether: bool,
+    has_dim_end: bool,
+    detected_version: Option<String>,
+    detected_type: Option<String>,
+}
+
+#[derive(Debug)]
+struct PreparedWorldSource {
+    world_root: PathBuf,
+    staged_root: Option<PathBuf>,
+    size_bytes: u64,
+    detected_version: Option<String>,
+    detected_type: Option<String>,
+    has_playerdata: bool,
+    has_data: bool,
+    has_dim_nether: bool,
+    has_dim_end: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct LevelDat {
+    #[serde(rename = "Data")]
+    data: LevelDatData,
+}
+
+#[derive(Debug, Deserialize)]
+struct LevelDatData {
+    #[serde(rename = "Version")]
+    version: Option<LevelDatVersion>,
+    #[serde(rename = "Modded")]
+    modded: Option<bool>,
+    #[serde(rename = "WasModded")]
+    was_modded: Option<bool>,
+    #[serde(rename = "wasModded")]
+    was_modded_legacy: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LevelDatVersion {
+    #[serde(rename = "Name")]
+    name: Option<String>,
+}
+
+fn is_valid_world_dir(path: &Path) -> bool {
+    path.join("level.dat").is_file() && path.join("region").is_dir()
+}
+
+fn find_world_root(path: &Path) -> Option<PathBuf> {
+    if is_valid_world_dir(path) {
+        return Some(path.to_path_buf());
+    }
+
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(path).ok()?.flatten() {
+        let child = entry.path();
+        if child.is_dir() {
+            candidates.push(child);
+        }
+    }
+    if candidates.len() == 1 && is_valid_world_dir(&candidates[0]) {
+        return Some(candidates.remove(0));
+    }
+
+    None
+}
+
+fn compute_dir_size(path: &Path) -> Result<u64, String> {
+    let mut total = 0u64;
+    for entry in WalkDir::new(path).into_iter().flatten() {
+        let entry_path = entry.path();
+        if entry_path.is_file() {
+            total += entry_path.metadata().map_err(|err| err.to_string())?.len();
+        }
+    }
+    Ok(total)
+}
+
+fn read_level_dat(world_root: &Path) -> Option<(Option<String>, bool)> {
+    let path = world_root.join("level.dat");
+    let file = File::open(&path).ok()?;
+    let mut decoder = flate2::read::GzDecoder::new(file);
+    let mut bytes = Vec::new();
+    decoder.read_to_end(&mut bytes).ok()?;
+    let level: LevelDat = from_bytes(&bytes).ok()?;
+
+    let detected_version = level
+        .data
+        .version
+        .and_then(|version| version.name)
+        .filter(|value| !value.trim().is_empty());
+    let modded = level.data.modded.unwrap_or(false)
+        || level.data.was_modded.unwrap_or(false)
+        || level.data.was_modded_legacy.unwrap_or(false);
+    Some((detected_version, modded))
+}
+
+fn detect_world_metadata(world_root: &Path) -> (Option<String>, Option<String>) {
+    let (level_version, level_modded) = read_level_dat(world_root).unwrap_or((None, false));
+    let has_forge_data = world_root.join("data").join("forge").exists()
+        || world_root.join("data").join("fml").exists();
+
+    let detected_type = if level_modded || has_forge_data {
+        Some("forge".to_string())
+    } else if level_version.is_some() {
+        Some("vanilla".to_string())
+    } else {
+        None
+    };
+
+    (level_version, detected_type)
+}
+
+fn validate_world_dir(path: &Path) -> Result<WorldValidationDetails, String> {
+    let root = find_world_root(path)
+        .ok_or_else(|| "Selected folder does not appear to be a valid Minecraft world.".to_string())?;
+    if !is_valid_world_dir(&root) {
+        return Err("Selected folder does not appear to be a valid Minecraft world.".to_string());
+    }
+
+    let has_playerdata = root.join("playerdata").is_dir();
+    let has_data = root.join("data").is_dir();
+    let has_dim_nether = root.join("DIM-1").is_dir();
+    let has_dim_end = root.join("DIM1").is_dir();
+    let (detected_version, detected_type) = detect_world_metadata(&root);
+
+    Ok(WorldValidationDetails {
+        world_root: root,
+        has_playerdata,
+        has_data,
+        has_dim_nether,
+        has_dim_end,
+        detected_version,
+        detected_type,
+    })
+}
+
+fn safe_extract_zip(zip_path: &Path, target_dir: &Path) -> Result<(), String> {
+    let file = File::open(zip_path).map_err(|err| err.to_string())?;
+    let mut archive =
+        ZipArchive::new(file).map_err(|_| "Selected zip file is corrupted or unsupported".to_string())?;
+
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i).map_err(|err| err.to_string())?;
+        let enclosed = match file.enclosed_name() {
+            Some(name) => name.to_owned(),
+            None => continue,
+        };
+        let outpath = target_dir.join(enclosed);
+        if file.name().ends_with('/') {
+            fs::create_dir_all(&outpath).map_err(|err| err.to_string())?;
+            continue;
+        }
+        if let Some(parent) = outpath.parent() {
+            fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        }
+        let mut outfile = File::create(&outpath).map_err(|err| err.to_string())?;
+        std::io::copy(&mut file, &mut outfile).map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+fn stage_world_zip(zip_path: &Path, base: &Path) -> Result<PathBuf, String> {
+    if !zip_path.exists() {
+        return Err("Zip file not found".to_string());
+    }
+    if zip_path.extension().and_then(|ext| ext.to_str()) != Some("zip") {
+        return Err("Only .zip worlds are supported".to_string());
+    }
+    let temp_root = base
+        .join("temp")
+        .join("world-import")
+        .join(format!("{}", Utc::now().timestamp_millis()));
+    fs::create_dir_all(&temp_root).map_err(|err| err.to_string())?;
+    safe_extract_zip(zip_path, &temp_root)?;
+    Ok(temp_root)
+}
+
+fn stage_mods_zip(zip_path: &Path, base: &Path) -> Result<PathBuf, String> {
+    if !zip_path.exists() {
+        return Err("Zip file not found".to_string());
+    }
+    if zip_path.extension().and_then(|ext| ext.to_str()) != Some("zip") {
+        return Err("Only .zip modpacks are supported".to_string());
+    }
+    let temp_root = base
+        .join("temp")
+        .join("mod-import")
+        .join(format!("{}", Utc::now().timestamp_millis()));
+    fs::create_dir_all(&temp_root).map_err(|err| err.to_string())?;
+    safe_extract_zip(zip_path, &temp_root)?;
+    Ok(temp_root)
+}
+
+fn find_mods_root(path: &Path) -> Option<PathBuf> {
+    let candidates = [
+        path.join("overrides").join("mods"),
+        path.join("mods"),
+        path.join("minecraft").join("mods"),
+    ];
+    for candidate in candidates {
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+
+    if path.is_dir() {
+        let has_jar = fs::read_dir(path)
+            .ok()?
+            .flatten()
+            .any(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("jar"));
+        if has_jar {
+            return Some(path.to_path_buf());
+        }
+    }
+
+    None
+}
+
+fn count_mods(mods_root: &Path) -> usize {
+    fs::read_dir(mods_root)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("jar"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn detect_modpack_type(root: &Path) -> Option<String> {
+    if root.join("modrinth.index.json").exists() {
+        return Some("modrinth".to_string());
+    }
+    if root.join("manifest.json").exists() {
+        return Some("curseforge".to_string());
+    }
+    None
+}
+
+fn normalize_loader_label(value: &str) -> String {
+    let lower = value.to_lowercase();
+    if lower.contains("fabric") {
+        return "fabric".to_string();
+    }
+    if lower.contains("forge") || lower.contains("fml") {
+        return "forge".to_string();
+    }
+    "none".to_string()
+}
+
+fn parse_curseforge_manifest(root: &Path) -> Result<Option<ModpackManifest>, String> {
+    let path = root.join("manifest.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(&path).map_err(|err| err.to_string())?;
+    let manifest: CurseForgeManifest = serde_json::from_str(&content).map_err(|err| err.to_string())?;
+    let loader = manifest
+        .minecraft
+        .mod_loaders
+        .iter()
+        .find(|loader| loader.primary)
+        .map(|loader| loader.id.as_str())
+        .or_else(|| manifest.minecraft.mod_loaders.first().map(|loader| loader.id.as_str()))
+        .map(normalize_loader_label)
+        .unwrap_or_else(|| "none".to_string());
+
+    let mods = manifest
+        .files
+        .into_iter()
+        .map(|entry| ModpackEntry {
+            id: entry.project_id.to_string(),
+            version: entry.file_id.to_string(),
+            sha256: String::new(),
+            url: String::new(),
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Some(ModpackManifest {
+        mc_version: manifest.minecraft.version,
+        loader,
+        mods,
+    }))
+}
+
+fn parse_modrinth_index(root: &Path) -> Result<Option<ModpackManifest>, String> {
+    let path = root.join("modrinth.index.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(&path).map_err(|err| err.to_string())?;
+    let manifest: ModrinthIndex = serde_json::from_str(&content).map_err(|err| err.to_string())?;
+    let mc_version = manifest
+        .dependencies
+        .get("minecraft")
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
+    let loader = if manifest.dependencies.contains_key("forge") {
+        "forge".to_string()
+    } else if manifest.dependencies.contains_key("fabric-loader") || manifest.dependencies.contains_key("fabric") {
+        "fabric".to_string()
+    } else {
+        "none".to_string()
+    };
+
+    let mods = manifest
+        .files
+        .into_iter()
+        .map(|entry| {
+            let name = Path::new(&entry.path)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("mod")
+                .to_string();
+            let sha256 = entry
+                .hashes
+                .get("sha256")
+                .cloned()
+                .unwrap_or_default();
+            let url = entry.downloads.first().cloned().unwrap_or_default();
+            ModpackEntry {
+                id: name,
+                version: "unknown".to_string(),
+                sha256,
+                url,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Some(ModpackManifest {
+        mc_version,
+        loader,
+        mods,
+    }))
+}
+
+fn build_modpack_from_source(root: &Path) -> Result<Option<ModpackManifest>, String> {
+    if let Some(modrinth) = parse_modrinth_index(root)? {
+        return Ok(Some(modrinth));
+    }
+    if let Some(curseforge) = parse_curseforge_manifest(root)? {
+        return Ok(Some(curseforge));
+    }
+    Ok(None)
+}
+
+fn prepare_mods_source(input: &ModsImportInput, base: &Path) -> Result<(PathBuf, Option<PathBuf>), String> {
+    let kind = input.source_kind.trim().to_lowercase();
+    if kind != "zip" && kind != "folder" {
+        return Err("Invalid mods source type".to_string());
+    }
+
+    let mut staged_root = None;
+    let source_root = if kind == "zip" {
+        if let Some(staged) = &input.staged_path {
+            let path = PathBuf::from(staged);
+            if !path.exists() {
+                return Err("Staged modpack folder not found".to_string());
+            }
+            staged_root = Some(path.clone());
+            path
+        } else {
+            let staged = stage_mods_zip(Path::new(&input.source_path), base)?;
+            staged_root = Some(staged.clone());
+            staged
+        }
+    } else {
+        let path = PathBuf::from(&input.source_path);
+        if !path.exists() || !path.is_dir() {
+            return Err("Mods folder not found".to_string());
+        }
+        path
+    };
+
+    Ok((source_root, staged_root))
+}
+
+#[tauri::command]
+fn validate_mods_source(
+    source_path: String,
+    source_kind: String,
+    state: State<AppState>,
+) -> Result<ModsValidationResult, String> {
+    let input = ModsImportInput {
+        source_path,
+        source_kind: source_kind.clone(),
+        staged_path: None,
+    };
+
+    let (source_root, staged_root) = prepare_mods_source(&input, &state.data_dir)?;
+    let mods_root = find_mods_root(&source_root)
+        .ok_or_else(|| "No .jar mods found in the selected source.".to_string())?;
+    let mod_count = count_mods(&mods_root);
+    if mod_count == 0 {
+        return Err("No .jar mods found in the selected source.".to_string());
+    }
+
+    Ok(ModsValidationResult {
+        valid: true,
+        source_kind,
+        mods_path: mods_root.to_string_lossy().to_string(),
+        staged_path: staged_root.map(|value| value.to_string_lossy().to_string()),
+        mod_count,
+        detected_pack: detect_modpack_type(&source_root),
+    })
+}
+
+fn import_mods_into_server(
+    server_dir: &Path,
+    input: &ModsImportInput,
+    state: &AppState,
+) -> Result<(), String> {
+    let (source_root, staged_root) = prepare_mods_source(input, &state.data_dir)?;
+    let mods_root = find_mods_root(&source_root)
+        .ok_or_else(|| "No .jar mods found in the selected source.".to_string())?;
+
+    let target_mods = server_dir.join("mods");
+    fs::create_dir_all(&target_mods).map_err(|err| err.to_string())?;
+
+    for entry in fs::read_dir(&mods_root).map_err(|err| err.to_string())? {
+        let entry = entry.map_err(|err| err.to_string())?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jar") {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let destination = target_mods.join(&file_name);
+        if destination.exists() {
+            return Err(format!(
+                "Mod already exists in target folder: {}",
+                file_name.to_string_lossy()
+            ));
+        }
+        fs::copy(&path, &destination).map_err(|err| err.to_string())?;
+    }
+
+    if let Some(manifest) = build_modpack_from_source(&source_root)? {
+        let _ = save_modpack(server_dir, &manifest);
+    }
+
+    if let Some(staged_root) = staged_root {
+        let temp_root = state.data_dir.join("temp").join("mod-import");
+        if staged_root.starts_with(&temp_root) {
+            let _ = fs::remove_dir_all(staged_root);
+        }
+    }
+
+    Ok(())
+}
+
+fn copy_dir_with_progress(
+    source: &Path,
+    destination: &Path,
+    app: &AppHandle,
+    server_name: &str,
+    total_bytes: u64,
+) -> Result<(), String> {
+    if !destination.exists() {
+        fs::create_dir_all(destination).map_err(|err| err.to_string())?;
+    }
+
+    let mut copied = 0u64;
+    let mut last_emit = Instant::now();
+
+    for entry in WalkDir::new(source) {
+        let entry = entry.map_err(|err| err.to_string())?;
+        let path = entry.path();
+        let relative = path.strip_prefix(source).map_err(|err| err.to_string())?;
+        let target = destination.join(relative);
+        if path.is_dir() {
+            fs::create_dir_all(&target).map_err(|err| err.to_string())?;
+            continue;
+        }
+
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        }
+
+        let mut input = File::open(path).map_err(|err| err.to_string())?;
+        let mut output = File::create(&target).map_err(|err| err.to_string())?;
+        let mut buffer = vec![0u8; 8 * 1024 * 1024];
+        loop {
+            let read = input.read(&mut buffer).map_err(|err| err.to_string())?;
+            if read == 0 {
+                break;
+            }
+            output.write_all(&buffer[..read]).map_err(|err| err.to_string())?;
+            copied = copied.saturating_add(read as u64);
+
+            if total_bytes > 0 && last_emit.elapsed() >= Duration::from_millis(250) {
+                let percent = ((copied as f64 / total_bytes as f64) * 100.0).round() as u8;
+                let payload = WorldCopyProgress {
+                    server_name: server_name.to_string(),
+                    total_bytes,
+                    copied_bytes: copied,
+                    percent: percent.min(100),
+                };
+                let _ = app.emit("world:copy", payload);
+                last_emit = Instant::now();
+            }
+        }
+    }
+
+    let percent = if total_bytes == 0 { 100 } else { 100 };
+    let payload = WorldCopyProgress {
+        server_name: server_name.to_string(),
+        total_bytes,
+        copied_bytes: total_bytes.max(copied),
+        percent,
+    };
+    let _ = app.emit("world:copy", payload);
+    Ok(())
+}
+
+fn set_level_name(server_dir: &Path, level_name: &str) -> Result<(), String> {
+    let path = server_dir.join("server.properties");
+    let content = fs::read_to_string(&path).unwrap_or_default();
+    let mut lines = Vec::new();
+    let mut updated = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.starts_with('!') || !trimmed.contains('=') {
+            lines.push(line.to_string());
+            continue;
+        }
+        let mut parts = trimmed.splitn(2, '=');
+        let key = parts.next().unwrap_or("").trim();
+        if key == "level-name" {
+            lines.push(format!("level-name={}", level_name));
+            updated = true;
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+
+    if !updated {
+        lines.push(format!("level-name={}", level_name));
+    }
+
+    fs::write(path, format!("{}\n", lines.join("\n"))).map_err(|err| err.to_string())
+}
+
+fn prepare_world_source(input: &WorldImportInput, base: &Path) -> Result<PreparedWorldSource, String> {
+    let kind = input.source_kind.trim().to_lowercase();
+    if kind != "zip" && kind != "folder" {
+        return Err("Invalid world source type".to_string());
+    }
+    let mut staged_root = None;
+
+    let source_root = if kind == "zip" {
+        if let Some(staged) = &input.staged_path {
+            let path = PathBuf::from(staged);
+            if !path.exists() {
+                return Err("Staged world folder not found".to_string());
+            }
+            staged_root = Some(path.clone());
+            path
+        } else {
+            let staged = stage_world_zip(Path::new(&input.source_path), base)?;
+            staged_root = Some(staged.clone());
+            staged
+        }
+    } else {
+        let path = PathBuf::from(&input.source_path);
+        if !path.exists() || !path.is_dir() {
+            return Err("World folder not found".to_string());
+        }
+        path
+    };
+
+    let details = validate_world_dir(&source_root)?;
+    let size_bytes = compute_dir_size(&details.world_root)?;
+
+    Ok(PreparedWorldSource {
+        world_root: details.world_root,
+        staged_root,
+        size_bytes,
+        detected_version: details.detected_version,
+        detected_type: details.detected_type,
+        has_playerdata: details.has_playerdata,
+        has_data: details.has_data,
+        has_dim_nether: details.has_dim_nether,
+        has_dim_end: details.has_dim_end,
+    })
+}
+
+fn import_world_into_server(
+    server_dir: &Path,
+    server_name: &str,
+    input: &WorldImportInput,
+    state: &AppState,
+    app: &AppHandle,
+) -> Result<(), String> {
+    let prepared = prepare_world_source(input, &state.data_dir)?;
+    let target = server_dir.join("world");
+    if target.exists() {
+        fs::remove_dir_all(&target).map_err(|err| err.to_string())?;
+    }
+
+    copy_dir_with_progress(&prepared.world_root, &target, app, server_name, prepared.size_bytes)?;
+    set_level_name(server_dir, "world")?;
+
+    if let Some(staged_root) = prepared.staged_root {
+        let temp_root = state.data_dir.join("temp").join("world-import");
+        if staged_root.starts_with(&temp_root) {
+            let _ = fs::remove_dir_all(staged_root);
+        }
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn validate_world_source(
+    source_path: String,
+    source_kind: String,
+    state: State<AppState>,
+) -> Result<WorldValidationResult, String> {
+    let input = WorldImportInput {
+        source_path: source_path.clone(),
+        source_kind: source_kind.clone(),
+        staged_path: None,
+    };
+    let prepared = prepare_world_source(&input, &state.data_dir)?;
+    let world_name = prepared
+        .world_root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("world")
+        .to_string();
+
+    Ok(WorldValidationResult {
+        valid: true,
+        source_kind,
+        world_name,
+        world_path: prepared.world_root.to_string_lossy().to_string(),
+        staged_path: prepared
+            .staged_root
+            .map(|value| value.to_string_lossy().to_string()),
+        size_bytes: prepared.size_bytes,
+        has_level_dat: prepared.world_root.join("level.dat").is_file(),
+        has_region: prepared.world_root.join("region").is_dir(),
+        has_playerdata: prepared.has_playerdata,
+        has_data: prepared.has_data,
+        has_dim_nether: prepared.has_dim_nether,
+        has_dim_end: prepared.has_dim_end,
+        detected_version: prepared.detected_version,
+        detected_type: prepared.detected_type,
     })
 }
 
@@ -3660,8 +5021,12 @@ pub fn run() {
             reinstall_server,
             analyze_server_folder_cmd,
             import_server,
+            validate_world_source,
+            validate_mods_source,
             export_world,
             get_server_meta,
+            get_server_metadata,
+            detect_server_metadata,
             update_server_meta,
             create_backup,
             list_backups,
@@ -3675,6 +5040,7 @@ pub fn run() {
             check_mod_sync,
             download_mods,
             detect_minecraft_client,
+            get_client_version_info,
             launch_minecraft,
             get_app_settings,
             update_app_settings,

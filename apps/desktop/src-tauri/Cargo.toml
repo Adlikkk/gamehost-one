@@ -30,6 +30,7 @@ reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"] }
 sha2 = "0.10"
 sha1 = "0.10"
 hex = "0.4"
+base64 = "0.22"
 sysinfo = "0.30"
 local-ip-address = "0.6"
 zip = "0.6"
@@ -37,6 +38,8 @@ walkdir = "2"
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
 urlencoding = "2"
+flate2 = "1"
+fastnbt = "2"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61.3", features = ["Win32_Graphics_Dwm", "Win32_Foundation"] }

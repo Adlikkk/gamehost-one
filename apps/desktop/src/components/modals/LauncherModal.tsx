@@ -3,11 +3,17 @@ import { PrimaryButton, SubtleButton } from "../ui/Buttons";
 export function LauncherModal({
   open,
   onClose,
-  onChoose
+  onChoose,
+  launcherPath,
+  onPickLauncherPath,
+  onClearLauncherPath
 }: {
   open: boolean;
   onClose: () => void;
   onChoose: (choice: "official" | "tlauncher") => void;
+  launcherPath?: string | null;
+  onPickLauncherPath: () => void;
+  onClearLauncherPath: () => void;
 }) {
   if (!open) return null;
 
@@ -29,6 +35,18 @@ export function LauncherModal({
         <div className="mt-5 grid gap-3">
           <PrimaryButton onClick={() => onChoose("official")}>Official Minecraft Launcher</PrimaryButton>
           <SubtleButton onClick={() => onChoose("tlauncher")}>TLauncher</SubtleButton>
+          <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-xs text-muted">
+            <p className="text-xs uppercase tracking-[0.2em] text-muted">Custom launcher path</p>
+            <p className="mt-2 break-all">{launcherPath ?? "Not set"}</p>
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <SubtleButton onClick={onPickLauncherPath}>Browse launcher exe</SubtleButton>
+              {launcherPath && (
+                <SubtleButton onClick={onClearLauncherPath} className="text-danger">
+                  Clear
+                </SubtleButton>
+              )}
+            </div>
+          </div>
         </div>
       </div>
     </div>

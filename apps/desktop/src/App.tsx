@@ -21,13 +21,23 @@ import { DeleteServerModal } from "./components/modals/DeleteServerModal";
 import { ImportServerModal } from "./components/modals/ImportServerModal";
 import { JavaModal } from "./components/modals/JavaModal";
 import { LauncherModal } from "./components/modals/LauncherModal";
+import { WorldStep } from "./components/CreateServerWizard/WorldStep";
+import { ModsStep } from "./components/CreateServerWizard/ModsStep";
 import { ServerSettingsFields } from "./components/ServerSettingsFields";
 import { PrimaryButton, SubtleButton } from "./components/ui/Buttons";
 import { Card } from "./components/ui/Card";
 import { SegmentedBar } from "./components/ui/SegmentedBar";
 import { SettingRow } from "./components/ui/SettingRow";
 import { StatusPill } from "./components/ui/StatusPill";
+import { MigrationWizard, type MigrationCreatePayload } from "./wizard/MigrationWizard";
 import { classNames } from "./utils/classNames";
+import { buildWorldImportPayload, pickAndValidateWorld } from "./services/worldImport";
+import { pickAndValidateMods } from "./services/modImport";
+import { detectServerMetadata } from "./services/modDetection";
+import { detectClient } from "./services/clientDetector";
+import { compareClientToServer } from "./services/versionComparator";
+import { launchMinecraft as launchMinecraftClient } from "./services/minecraftLauncher";
+import { useServerMetadata } from "./hooks/useServerMetadata";
 import type {
   AppSettings,
   ApplyResult,
@@ -37,10 +47,12 @@ import type {
   ImportAnalysis,
   JavaStatusResult,
   LauncherChoice,
-  MinecraftClientStatus,
+  ClientDetectionResult,
   ModEntry,
   ModpackManifest,
   ModSyncStatus,
+  ModsImportMode,
+  ModsValidationResult,
   NetworkInfo,
   ResourceUsage,
   ServerConfig,
@@ -49,7 +61,11 @@ import type {
   ServerStatus,
   UpdateInfo,
   VersionGroup,
-  View
+  View,
+  WorldCopyProgress,
+  WorldImportMode,
+  WorldImportPayload,
+  WorldValidationResult
 } from "./types";
 
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -159,6 +175,7 @@ const VERSION_OPTIONS: Record<ServerConfig["server_type"], VersionGroup[]> = {
 
 const RAM_OPTIONS = [2, 4, 6, 8, 12];
 const MAX_VERSION_OPTIONS = 200;
+const MAX_VERSION_OPTIONS_FORGE = 5;
 const BACKUP_INTERVALS = [30, 60, 360, 1440] as const;
 const UPDATE_REPO = "Adlikkk/gamehost-one-app";
 
@@ -255,6 +272,88 @@ const getActionState = (status: ServerStatus) => {
   };
 };
 
+function CreateServerMenu({
+  label,
+  onCreate,
+  onImport,
+  onMigrate,
+  dataTutorial
+}: {
+  label: string;
+  onCreate: () => void;
+  onImport: () => void;
+  onMigrate: () => void;
+  dataTutorial?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const handleClick = (event: MouseEvent) => {
+      if (!menuRef.current) return;
+      if (!menuRef.current.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    window.addEventListener("mousedown", handleClick);
+    return () => window.removeEventListener("mousedown", handleClick);
+  }, [open]);
+
+  return (
+    <div className="relative inline-flex group" ref={menuRef}>
+      <div className="inline-flex overflow-hidden rounded-full bg-one shadow-soft transition duration-200 group-hover:-translate-y-0.5 group-hover:shadow-[0_12px_30px_rgba(79,209,197,0.25)]">
+        <button
+          type="button"
+          className="px-5 py-2 text-sm font-semibold text-white transition hover:bg-one/90"
+          onClick={() => {
+            setOpen(false);
+            onCreate();
+          }}
+          data-tutorial={dataTutorial}
+        >
+          {label}
+        </button>
+        <button
+          type="button"
+          className="flex items-center px-3 text-sm font-semibold text-white transition hover:bg-one/90"
+          aria-label="Open create server menu"
+          onClick={() => setOpen((prev) => !prev)}
+        >
+          <span className="h-5 w-px bg-white/25 transition group-hover:bg-white/40" aria-hidden="true" />
+          <span className="pl-3" aria-hidden="true">
+            <svg viewBox="0 0 20 20" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M6 8l4 4 4-4" />
+            </svg>
+          </span>
+        </button>
+      </div>
+      {open && (
+        <div className="absolute right-0 top-full z-40 mt-2 w-56 rounded-2xl border border-white/10 bg-surface shadow-soft">
+          <button
+            className="flex w-full items-center gap-2 rounded-2xl px-4 py-3 text-sm text-text transition hover:bg-white/10"
+            onClick={() => {
+              setOpen(false);
+              onImport();
+            }}
+          >
+            Import existing server
+          </button>
+          <button
+            className="flex w-full items-center gap-2 rounded-2xl px-4 py-3 text-sm text-text transition hover:bg-white/10"
+            onClick={() => {
+              setOpen(false);
+              onMigrate();
+            }}
+          >
+            Migrate hosted world
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 const normalizeStatus = (value: string): ServerStatus => {
   if (value === "STOPPED" || value === "STARTING" || value === "RUNNING" || value === "ERROR") {
     return value;
@@ -271,7 +370,15 @@ function getServerTypeLabel(value: ServerConfig["server_type"]) {
 
 function formatLoaderLabel(value?: string | null) {
   if (!value || value === "none") return "Vanilla";
+  if (value === "quilt") return "Quilt";
   return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
+function getForgeDownloadUrl(version?: string | null) {
+  if (!version) return null;
+  const mcVersion = version.split("-")[0]?.trim();
+  if (!mcVersion) return null;
+  return `https://files.minecraftforge.net/net/minecraftforge/forge/index_${mcVersion}.html`;
 }
 
 function normalizeRamEven(value: number) {
@@ -282,10 +389,10 @@ function countVersions(groups: VersionGroup[]) {
   return groups.reduce((total, group) => total + group.versions.length, 0);
 }
 
-function trimVersionGroups(groups: VersionGroup[], term: string) {
+function trimVersionGroups(groups: VersionGroup[], term: string, limit = MAX_VERSION_OPTIONS) {
   const normalized = term.trim().toLowerCase();
   if (!normalized) {
-    let remaining = MAX_VERSION_OPTIONS;
+    let remaining = limit;
     const limited = groups
       .map((group) => {
         if (remaining <= 0) return { ...group, versions: [] };
@@ -307,6 +414,27 @@ function trimVersionGroups(groups: VersionGroup[], term: string) {
     .filter((group) => group.versions.length > 0);
 }
 
+function matchForgeVersion(versions: string[], detected: string) {
+  const clean = detected.trim();
+  if (!clean) return null;
+  const minorPrefix = clean.split(".").slice(0, 2).join(".");
+  return (
+    versions.find((version) => version === clean) ??
+    versions.find((version) => version.startsWith(`${clean}-`)) ??
+    (minorPrefix ? versions.find((version) => version.startsWith(`${minorPrefix}.`)) : undefined) ??
+    (minorPrefix ? versions.find((version) => version.startsWith(`${minorPrefix}-`)) : undefined) ??
+    null
+  );
+}
+
+function buildForgeVersionList(versions: string[], selected: string | null, limit: number) {
+  const limited = versions.slice(0, limit);
+  if (selected && versions.includes(selected) && !limited.includes(selected)) {
+    return [selected, ...limited];
+  }
+  return limited;
+}
+
 
 function App() {
   const [view, setView] = useState<View>("loading");
@@ -319,6 +447,7 @@ function App() {
   const [activeServerId, setActiveServerId] = useState<string | null>(null);
   const [servers, setServers] = useState<ServerConfig[]>([]);
   const [selectedServer, setSelectedServer] = useState<ServerConfig | null>(null);
+  const { metadata: serverMetadata } = useServerMetadata(selectedServer?.name);
   const [status, setStatus] = useState<ServerStatus>("STOPPED");
   const [javaModalOpen, setJavaModalOpen] = useState(false);
   const [javaStatus, setJavaStatus] = useState<JavaStatusResult | null>(null);
@@ -330,6 +459,7 @@ function App() {
   } | null>(null);
   const [launcherChoice, setLauncherChoice] = useState<LauncherChoice | null>(null);
   const [launcherChoiceOpen, setLauncherChoiceOpen] = useState(false);
+  const [launcherOpenedAt, setLauncherOpenedAt] = useState<number | null>(null);
   const [consoleLines, setConsoleLines] = useState<string[]>([]);
   const [installing, setInstalling] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -355,6 +485,22 @@ function App() {
   const [iconSaving, setIconSaving] = useState(false);
   const [wizardSettings, setWizardSettings] = useState<ServerSettings>(DEFAULT_SETTINGS);
   const [wizardAdvancedOpen, setWizardAdvancedOpen] = useState(false);
+  const [wizardWorldMode, setWizardWorldMode] = useState<WorldImportMode>("generate");
+  const [wizardWorldSource, setWizardWorldSource] = useState<string | null>(null);
+  const [wizardWorldValidation, setWizardWorldValidation] = useState<WorldValidationResult | null>(null);
+  const [wizardWorldError, setWizardWorldError] = useState<string | null>(null);
+  const [wizardWorldBusy, setWizardWorldBusy] = useState(false);
+  const [wizardWorldCopy, setWizardWorldCopy] = useState<WorldCopyProgress | null>(null);
+  const [wizardWorldCopied, setWizardWorldCopied] = useState(false);
+  const [wizardWorldDetected, setWizardWorldDetected] = useState<{
+    type: "forge" | "vanilla" | null;
+    version: string | null;
+  }>({ type: null, version: null });
+  const [wizardModsMode, setWizardModsMode] = useState<ModsImportMode>("skip");
+  const [wizardModsSource, setWizardModsSource] = useState<string | null>(null);
+  const [wizardModsValidation, setWizardModsValidation] = useState<ModsValidationResult | null>(null);
+  const [wizardModsError, setWizardModsError] = useState<string | null>(null);
+  const [wizardModsBusy, setWizardModsBusy] = useState(false);
   const [settingsAdvancedOpen, setSettingsAdvancedOpen] = useState(false);
   const [serverSettingsByName, setServerSettingsByName] = useState<Record<string, ServerSettings>>({});
   const [isMaximized, setIsMaximized] = useState(false);
@@ -367,6 +513,7 @@ function App() {
   const [ramDraft, setRamDraft] = useState(4);
   const [ramManualOpen, setRamManualOpen] = useState(false);
   const [ramManualInput, setRamManualInput] = useState("4");
+  const [wizardRamAuto, setWizardRamAuto] = useState(true);
   const [onlineModeDraft, setOnlineModeDraft] = useState(true);
   const [configSaving, setConfigSaving] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<ServerConfig | null>(null);
@@ -377,8 +524,12 @@ function App() {
   const [modpack, setModpack] = useState<ModpackManifest | null>(null);
   const [modSync, setModSync] = useState<ModSyncStatus | null>(null);
   const [modSyncLoading, setModSyncLoading] = useState(false);
-  const [clientStatus, setClientStatus] = useState<MinecraftClientStatus | null>(null);
+  const [modSyncModalOpen, setModSyncModalOpen] = useState(false);
+  const [modsModalOpen, setModsModalOpen] = useState(false);
+  const [clientStatus, setClientStatus] = useState<ClientDetectionResult | null>(null);
   const [clientChecking, setClientChecking] = useState(false);
+  const [clientMismatchOpen, setClientMismatchOpen] = useState(false);
+  const [clientMismatchDismissed, setClientMismatchDismissed] = useState(false);
   const [joinHelpOpen, setJoinHelpOpen] = useState(false);
   const [joinIp, setJoinIp] = useState<string | null>(null);
   const [compatHelpOpen, setCompatHelpOpen] = useState(false);
@@ -445,53 +596,115 @@ function App() {
     const suggested = Math.floor(systemRamGb * 0.6);
     return normalizeRamEven(Math.min(Math.max(2, suggested), safeRamMaxGb));
   }, [systemRamGb, safeRamMaxGb]);
+  const wizardRecommendedRamGb = useMemo(() => {
+    if (!systemRamGb) return null;
+    let suggested = 4;
+    if (wizardModsValidation?.mod_count) {
+      suggested += Math.ceil(wizardModsValidation.mod_count / 25);
+    }
+    if ((wizardWorldValidation?.size_bytes ?? 0) > 1024 * 1024 * 1024) {
+      suggested += 1;
+    }
+    suggested = Math.max(2, suggested);
+    const capped = Math.min(suggested, safeRamMaxGb);
+    return normalizeRamEven(capped);
+  }, [systemRamGb, wizardModsValidation, wizardWorldValidation, safeRamMaxGb]);
+  const serverRecommendedRamGb = useMemo(() => {
+    if (!systemRamGb) return null;
+    if (!modpack?.mods?.length) return recommendedRamGb;
+    let suggested = 4 + Math.ceil(modpack.mods.length / 25);
+    suggested = Math.max(2, suggested);
+    const capped = Math.min(suggested, safeRamMaxGb);
+    return normalizeRamEven(capped);
+  }, [systemRamGb, modpack, recommendedRamGb, safeRamMaxGb]);
   const ramOptions = useMemo(
     () => RAM_OPTIONS.filter((ram) => (!systemRamGb ? true : ram <= systemRamGb)),
     [systemRamGb]
   );
+  const wizardRamOptions = useMemo(() => {
+    const max = safeRamMaxGb || 12;
+    const floor = wizardRecommendedRamGb ?? recommendedRamGb ?? null;
+    if (!floor) {
+      return ramOptions.slice(0, 4);
+    }
+    const options: number[] = [];
+    for (let i = 0; i <= 3; i += 1) {
+      const next = floor + i * 2;
+      if (next <= max) options.push(next);
+    }
+    if (wizardRam && !options.includes(wizardRam)) {
+      options.unshift(wizardRam);
+    }
+    return options;
+  }, [safeRamMaxGb, wizardRecommendedRamGb, recommendedRamGb, wizardRam, ramOptions]);
+  const serverRamOptions = useMemo(() => {
+    const max = safeRamMaxGb || 12;
+    const floor = serverRecommendedRamGb ?? null;
+    if (!floor) {
+      return ramOptions.slice(0, 4);
+    }
+    const options: number[] = [];
+    for (let i = 0; i <= 3; i += 1) {
+      const next = floor + i * 2;
+      if (next <= max) options.push(next);
+    }
+    if (ramDraft && !options.includes(ramDraft)) {
+      options.unshift(ramDraft);
+    }
+    return options;
+  }, [safeRamMaxGb, serverRecommendedRamGb, ramDraft, ramOptions]);
   const deleteMatches = deleteTarget ? deleteConfirm.trim() === deleteTarget.name : false;
   const detailDeleteMatches = selectedServer ? deleteConfirm.trim() === selectedServer.name : false;
   const appDataDisplay = appDataPath ?? "C:\\Users\\Adam\\AppData\\Roaming\\com.gamehost.one";
   const effectiveAppSettings = appSettings ?? {
     analytics_enabled: false,
     crash_reporting_enabled: false,
-    analytics_endpoint: null
+    analytics_endpoint: null,
+    launcher_path: null
   };
   const deferredWizardFilter = useDeferredValue(wizardVersionFilter);
   const deferredReinstallFilter = useDeferredValue(reinstallVersionFilter);
+  const wizardWorldReady =
+    wizardWorldMode === "generate" || Boolean(wizardWorldSource && wizardWorldValidation?.valid);
+  const wizardModsReady =
+    wizardModsMode === "skip" || Boolean(wizardModsSource && wizardModsValidation?.valid);
 
   const wizardVersionGroups = useMemo<VersionGroup[]>(() => {
     if (wizardType === "forge" && wizardForgeVersions.length > 0) {
-      return [{ label: "All Versions", versions: wizardForgeVersions.map((value) => ({ value })) }];
+      const list = buildForgeVersionList(wizardForgeVersions, wizardVersion, MAX_VERSION_OPTIONS_FORGE);
+      return [{ label: "All Versions", versions: list.map((value) => ({ value })) }];
     }
     return VERSION_OPTIONS[wizardType];
-  }, [wizardType, wizardForgeVersions]);
+  }, [wizardType, wizardForgeVersions, wizardVersion]);
 
+  const wizardVersionLimit = wizardType === "forge" ? MAX_VERSION_OPTIONS_FORGE : MAX_VERSION_OPTIONS;
   const wizardFilteredVersionGroups = useMemo<VersionGroup[]>(
-    () => trimVersionGroups(wizardVersionGroups, deferredWizardFilter),
-    [wizardVersionGroups, deferredWizardFilter]
+    () => trimVersionGroups(wizardVersionGroups, deferredWizardFilter, wizardVersionLimit),
+    [wizardVersionGroups, deferredWizardFilter, wizardVersionLimit]
   );
 
   const reinstallVersionGroups = useMemo<VersionGroup[]>(() => {
     if (reinstallType === "forge" && reinstallForgeVersions.length > 0) {
-      return [{ label: "All Versions", versions: reinstallForgeVersions.map((value) => ({ value })) }];
+      const list = buildForgeVersionList(reinstallForgeVersions, reinstallVersion, MAX_VERSION_OPTIONS_FORGE);
+      return [{ label: "All Versions", versions: list.map((value) => ({ value })) }];
     }
     return VERSION_OPTIONS[reinstallType];
-  }, [reinstallType, reinstallForgeVersions]);
+  }, [reinstallType, reinstallForgeVersions, reinstallVersion]);
 
+  const reinstallVersionLimit = reinstallType === "forge" ? MAX_VERSION_OPTIONS_FORGE : MAX_VERSION_OPTIONS;
   const reinstallFilteredVersionGroups = useMemo<VersionGroup[]>(
-    () => trimVersionGroups(reinstallVersionGroups, deferredReinstallFilter),
-    [reinstallVersionGroups, deferredReinstallFilter]
+    () => trimVersionGroups(reinstallVersionGroups, deferredReinstallFilter, reinstallVersionLimit),
+    [reinstallVersionGroups, deferredReinstallFilter, reinstallVersionLimit]
   );
 
   const wizardVersionLimitHit = useMemo(
-    () => wizardVersionFilter.trim().length === 0 && countVersions(wizardVersionGroups) > MAX_VERSION_OPTIONS,
-    [wizardVersionFilter, wizardVersionGroups]
+    () => wizardVersionFilter.trim().length === 0 && countVersions(wizardVersionGroups) > wizardVersionLimit,
+    [wizardVersionFilter, wizardVersionGroups, wizardVersionLimit]
   );
 
   const reinstallVersionLimitHit = useMemo(
-    () => reinstallVersionFilter.trim().length === 0 && countVersions(reinstallVersionGroups) > MAX_VERSION_OPTIONS,
-    [reinstallVersionFilter, reinstallVersionGroups]
+    () => reinstallVersionFilter.trim().length === 0 && countVersions(reinstallVersionGroups) > reinstallVersionLimit,
+    [reinstallVersionFilter, reinstallVersionGroups, reinstallVersionLimit]
   );
 
   const updateActiveSettings = (next: ServerSettings) => {
@@ -524,6 +737,9 @@ function App() {
       try {
         const list = await invoke<ServerConfig[]>("list_servers");
         setServers(list);
+        list.forEach((server) => {
+          detectServerMetadata(server.name).catch(() => {});
+        });
         if (list.length > 0) {
           setSelectedServer(list[0]);
           await loadServerIcons(list);
@@ -576,6 +792,12 @@ function App() {
       listen<number>("java:download", (event) => {
         const value = Math.max(0, Math.min(100, Number(event.payload)));
         setJavaDownloadProgress(value);
+      }),
+      listen<WorldCopyProgress>("world:copy", (event) => {
+        setWizardWorldCopy(event.payload);
+        if (event.payload.percent >= 100) {
+          setWizardWorldCopied(true);
+        }
       })
     ]);
 
@@ -686,13 +908,73 @@ function App() {
     invoke<string[]>("get_forge_versions")
       .then((versions) => {
         setWizardForgeVersions(versions);
-        if (versions.length > 0) {
-          setWizardVersion(versions[0]);
-        }
+        if (versions.length === 0) return;
+        const detected = wizardWorldDetected.type === "forge" ? wizardWorldDetected.version : null;
+        const match = detected ? matchForgeVersion(versions, detected) : null;
+        setWizardVersion(match ?? versions[0]);
       })
       .catch(() => setWizardForgeVersions([]))
       .finally(() => setWizardForgeLoading(false));
-  }, [wizardType]);
+  }, [wizardType, wizardWorldDetected]);
+
+  useEffect(() => {
+    if (wizardWorldMode !== "import" || !wizardWorldDetected.type) return;
+    if (wizardType !== wizardWorldDetected.type) {
+      setWizardType(wizardWorldDetected.type);
+    }
+  }, [wizardWorldMode, wizardWorldDetected.type, wizardType]);
+
+  useEffect(() => {
+    if (wizardWorldMode !== "import") return;
+    if (wizardWorldDetected.type !== "forge") return;
+    if (!wizardWorldDetected.version) return;
+    if (wizardForgeVersions.length === 0) return;
+    const match = matchForgeVersion(wizardForgeVersions, wizardWorldDetected.version) ?? wizardForgeVersions[0];
+    if (match && wizardVersion !== match) setWizardVersion(match);
+  }, [wizardWorldMode, wizardWorldDetected, wizardForgeVersions, wizardVersion]);
+
+  useEffect(() => {
+    if (wizardWorldMode !== "import") return;
+    if (wizardWorldDetected.type !== "vanilla") return;
+    if (!wizardWorldDetected.version) return;
+    if (wizardVersion !== wizardWorldDetected.version) {
+      setWizardVersion(wizardWorldDetected.version);
+    }
+  }, [wizardWorldMode, wizardWorldDetected, wizardVersion]);
+
+  useEffect(() => {
+    if (wizardWorldMode === "generate") {
+      setWizardWorldSource(null);
+      setWizardWorldValidation(null);
+      setWizardWorldError(null);
+      setWizardWorldCopy(null);
+      setWizardWorldCopied(false);
+      setWizardWorldDetected({ type: null, version: null });
+      setWizardRamAuto(true);
+    }
+  }, [wizardWorldMode]);
+
+  useEffect(() => {
+    if (wizardModsMode === "skip") {
+      setWizardModsSource(null);
+      setWizardModsValidation(null);
+      setWizardModsError(null);
+    }
+  }, [wizardModsMode]);
+
+  useEffect(() => {
+    if (wizardType !== "forge" && wizardModsMode !== "skip") {
+      setWizardModsMode("skip");
+    }
+  }, [wizardType, wizardModsMode]);
+
+  useEffect(() => {
+    if (!wizardWorldValidation?.valid) return;
+    setWizardWorldDetected({
+      type: wizardWorldValidation.detected_type ?? null,
+      version: wizardWorldValidation.detected_version?.trim() ?? null
+    });
+  }, [wizardWorldValidation]);
 
   useEffect(() => {
     setReinstallVersionFilter("");
@@ -752,6 +1034,14 @@ function App() {
   }, [safeRamMaxGb, wizardRam, ramDraft]);
 
   useEffect(() => {
+    if (!wizardRamAuto || !wizardRecommendedRamGb) return;
+    if (wizardRam !== wizardRecommendedRamGb) {
+      setWizardRam(wizardRecommendedRamGb);
+      setRamManualInput(String(wizardRecommendedRamGb));
+    }
+  }, [wizardRamAuto, wizardRecommendedRamGb, wizardRam]);
+
+  useEffect(() => {
     if (!selectedServer) return;
     setServerSettingsByName((prev) =>
       prev[selectedServer.name] ? prev : { ...prev, [selectedServer.name]: DEFAULT_SETTINGS }
@@ -783,6 +1073,18 @@ function App() {
     if (!launcherChoice) return;
     window.localStorage.setItem("gho_launcher_choice", launcherChoice);
   }, [launcherChoice]);
+
+  useEffect(() => {
+    if (clientStatus?.running) {
+      setLauncherOpenedAt(null);
+    }
+  }, [clientStatus]);
+
+  useEffect(() => {
+    if (!launcherOpenedAt) return;
+    const timeout = setTimeout(() => setLauncherOpenedAt(null), 60000);
+    return () => clearTimeout(timeout);
+  }, [launcherOpenedAt]);
 
   useEffect(() => {
     if (view !== "library" || welcomeShownRef.current) return;
@@ -979,12 +1281,102 @@ function App() {
     await getCurrentWindow().close();
   };
 
+  const handleWorldModeChange = (next: WorldImportMode) => {
+    setWizardWorldMode(next);
+    if (next === "import") {
+      setWizardWorldError(null);
+    }
+  };
+
+  const handleModsModeChange = (next: ModsImportMode) => {
+    setWizardModsMode(next);
+    if (next !== "skip") {
+      setWizardModsError(null);
+    }
+  };
+
+  const handleOpenWizard = () => {
+    setView("wizard");
+    if (tutorialActive && activeTutorialStep?.id === "create") {
+      nextTutorial();
+    }
+  };
+
+  const handlePickWorld = async (kind: "folder" | "zip") => {
+    setWizardWorldBusy(true);
+    setWizardWorldError(null);
+    try {
+      const result = await pickAndValidateWorld(kind);
+      if (!result) return;
+      setWizardWorldSource(result.sourcePath);
+      setWizardWorldValidation(result.validation);
+      setWizardWorldCopy(null);
+      setWizardWorldCopied(false);
+    } catch (err) {
+      setWizardWorldError(String(err));
+      setWizardWorldValidation(null);
+    } finally {
+      setWizardWorldBusy(false);
+    }
+  };
+
+  const handleClearWorld = () => {
+    setWizardWorldSource(null);
+    setWizardWorldValidation(null);
+    setWizardWorldError(null);
+    setWizardWorldCopy(null);
+    setWizardWorldCopied(false);
+  };
+
+  const handlePickMods = async (kind: "folder" | "zip") => {
+    setWizardModsBusy(true);
+    setWizardModsError(null);
+    try {
+      const result = await pickAndValidateMods(kind);
+      if (!result) return;
+      setWizardModsSource(result.sourcePath);
+      setWizardModsValidation(result.validation);
+    } catch (err) {
+      setWizardModsError(String(err));
+      setWizardModsValidation(null);
+    } finally {
+      setWizardModsBusy(false);
+    }
+  };
+
+  const handleClearMods = () => {
+    setWizardModsSource(null);
+    setWizardModsValidation(null);
+    setWizardModsError(null);
+  };
+
   const handleCreateServer = async () => {
     if (!isTauri) return;
+    if (!wizardWorldReady) {
+      setWizardWorldError("Select a valid world before creating the server.");
+      return;
+    }
+    if (!wizardModsReady) {
+      setWizardModsError("Select valid mods or skip this step.");
+      return;
+    }
     setInstalling(true);
     setError(null);
 
     try {
+      setWizardWorldCopied(false);
+      const worldImportPayload: WorldImportPayload | null =
+        wizardWorldMode === "import" && wizardWorldSource && wizardWorldValidation?.valid
+          ? buildWorldImportPayload(wizardWorldSource, wizardWorldValidation)
+          : null;
+      const modImportPayload =
+        wizardModsMode !== "skip" && wizardModsSource && wizardModsValidation?.valid
+          ? {
+              source_path: wizardModsSource,
+              source_kind: wizardModsValidation.source_kind,
+              staged_path: wizardModsValidation.staged_path ?? null
+            }
+          : null;
       const created = await invoke<ServerConfig>("create_server", {
         config: {
           name: wizardName.trim(),
@@ -992,7 +1384,9 @@ function App() {
           version: wizardVersion,
           ramGb: wizardRam,
           onlineMode: wizardOnlineMode,
-          port: 25565
+          port: 25565,
+          worldImport: worldImportPayload,
+          modImport: modImportPayload
         }
       });
       setServers((prev) => [...prev, created]);
@@ -1006,6 +1400,9 @@ function App() {
       const defaultMotd = "Gamehost ONE server";
       setMotdDraft(defaultMotd);
       await saveMotd(defaultMotd, created);
+      if (worldImportPayload) {
+        setWizardWorldCopied(true);
+      }
     } catch (err) {
       const message = String(err);
       setError(message);
@@ -1013,6 +1410,37 @@ function App() {
     } finally {
       setInstalling(false);
     }
+  };
+
+  const handleMigrationCreate = async (payload: MigrationCreatePayload) => {
+    if (!isTauri) {
+      throw new Error("Tauri runtime is not available.");
+    }
+
+    const created = await invoke<ServerConfig>("create_server", {
+      config: {
+        name: payload.name,
+        serverType: payload.serverType,
+        version: payload.version,
+        ramGb: payload.ramGb,
+        onlineMode: payload.onlineMode,
+        port: 25565,
+        worldImport: payload.worldImport,
+        modImport: payload.modImport ?? null
+      }
+    });
+
+    setServers((prev) => [...prev, created]);
+    setSelectedServer(created);
+    setServerSettingsByName((prev) => ({ ...prev, [created.name]: DEFAULT_SETTINGS }));
+    setView("servers");
+    await loadServerIcons([created]);
+    await loadMotd(created);
+    await loadBackups(created);
+    await loadServerMeta(created);
+    const defaultMotd = "Gamehost ONE server";
+    setMotdDraft(defaultMotd);
+    await saveMotd(defaultMotd, created);
   };
 
   const sendCommand = async (command: string) => {
@@ -1102,10 +1530,26 @@ function App() {
   const launchMinecraft = async (choice: LauncherChoice) => {
     if (!isTauri) return;
     try {
-      await invoke("launch_minecraft", {
+      await launchMinecraftClient(
         choice,
-        version: selectedServer?.version ?? null
-      });
+        selectedServer?.version ?? null,
+        selectedServer?.name ?? null
+      );
+      setLauncherOpenedAt(Date.now());
+    } catch (err) {
+      setUiToast({ tone: "error", message: String(err) });
+    }
+  };
+
+  const handleOpenLauncherOnly = async () => {
+    if (!launcherChoice) {
+      setLauncherChoiceOpen(true);
+      return;
+    }
+    if (!isTauri) return;
+    try {
+      await launchMinecraftClient(launcherChoice, null, null);
+      setLauncherOpenedAt(Date.now());
     } catch (err) {
       setUiToast({ tone: "error", message: String(err) });
     }
@@ -1125,13 +1569,42 @@ function App() {
     await launchMinecraft(choice);
   };
 
+  const handlePickLauncherPath = async () => {
+    if (!isTauri) return;
+    const selection = await open({
+      multiple: false,
+      filters: [{ name: "Launcher", extensions: ["exe"] }]
+    });
+    if (!selection || Array.isArray(selection)) return;
+    await saveAppSettings({
+      ...effectiveAppSettings,
+      launcher_path: selection
+    });
+  };
+
+  const handleClearLauncherPath = async () => {
+    if (!isTauri) return;
+    await saveAppSettings({
+      ...effectiveAppSettings,
+      launcher_path: null
+    });
+  };
+
   const handleDownloadMissingMods = async () => {
     if (!selectedServer || !isTauri) return;
     const missingIds = (modSync?.mods ?? [])
-      .filter((entry) => entry.status !== "installed")
+      .filter((entry) => entry.status === "missing")
       .map((entry) => entry.id);
+    const hasUnknown = Boolean(modSync?.mods?.some((entry) => entry.status === "unknown"));
+    const hasConflict = Boolean(modSync?.mods?.some((entry) => entry.status === "conflict"));
     if (missingIds.length === 0) {
-      setUiToast({ tone: "success", message: "Mods are already in sync." });
+      if (hasConflict) {
+        setUiToast({ tone: "error", message: "Mods conflict detected." });
+      } else if (hasUnknown) {
+        setUiToast({ tone: "error", message: "Client mods not detected. Sync is unavailable." });
+      } else {
+        setUiToast({ tone: "success", message: "Mods are already in sync." });
+      }
       return;
     }
     setModSyncLoading(true);
@@ -1148,6 +1621,9 @@ function App() {
 
   const handleJoinServer = async () => {
     if (!selectedServer) return;
+    if (!clientStatus?.running) {
+      await handleLaunchMinecraft();
+    }
     let ip = network?.local_ip ?? "127.0.0.1";
     try {
       const info = await invoke<NetworkInfo>("get_network_info", { port: selectedServer.port });
@@ -1167,8 +1643,27 @@ function App() {
     setJoinHelpOpen(true);
   };
 
+  const handleOpenForgeDownload = async () => {
+    const url = getForgeDownloadUrl(selectedServer?.version ?? null);
+    if (!url) return;
+    try {
+      await openUrl(url);
+    } catch (err) {
+      setUiToast({ tone: "error", message: String(err) });
+    }
+  };
+
   const openClientModsFolder = async () => {
     try {
+      if (selectedServer?.server_dir) {
+        const modsDir = await join(selectedServer.server_dir, "mods");
+        if (await exists(modsDir)) {
+          await openPath(modsDir);
+        } else {
+          await openPath(selectedServer.server_dir);
+        }
+        return;
+      }
       const base = await dataDir();
       const modsDir = await join(base, ".minecraft", "mods");
       await openPath(modsDir);
@@ -1259,6 +1754,56 @@ function App() {
         setUiToast({ tone: "success", message: "Settings saved. Restart required." });
       } else {
         setUiToast({ tone: "success", message: "Settings applied." });
+      }
+    } catch (err) {
+      setUiToast({ tone: "error", message: String(err) });
+    } finally {
+      setConfigSaving(false);
+    }
+  };
+
+  const handleApplyRam = async () => {
+    if (!selectedServer || !isTauri) return;
+    setConfigSaving(true);
+    try {
+      const isRunning = serverStatusFor(selectedServer) === "RUNNING";
+      if (isRunning) {
+        await invoke<BackupEntry>("create_backup", {
+          serverId: selectedServer.name,
+          includeNether: backupIncludeNether,
+          includeEnd: backupIncludeEnd,
+          reason: "ram_change"
+        });
+        await runServerAction("stop", selectedServer);
+      }
+
+      const result = await invoke<ApplyResult>("update_server_config", {
+        payload: {
+          serverId: selectedServer.name,
+          ramGb: ramDraft,
+          onlineMode: onlineModeDraft
+        }
+      });
+
+      setServers((prev) =>
+        prev.map((server) =>
+          server.name === selectedServer.name
+            ? { ...server, ram_gb: ramDraft, online_mode: onlineModeDraft }
+            : server
+        )
+      );
+      setSelectedServer((prev) =>
+        prev ? { ...prev, ram_gb: ramDraft, online_mode: onlineModeDraft } : prev
+      );
+
+      if (isRunning) {
+        await runServerAction("start", selectedServer);
+      }
+
+      if (result.pending_restart && !isRunning) {
+        setUiToast({ tone: "success", message: "RAM saved. Restart required." });
+      } else {
+        setUiToast({ tone: "success", message: "RAM applied." });
       }
     } catch (err) {
       setUiToast({ tone: "error", message: String(err) });
@@ -1436,10 +1981,10 @@ function App() {
     if (!isTauri) return;
     setClientChecking(true);
     try {
-      const status = await invoke<MinecraftClientStatus>("detect_minecraft_client");
+      const status = await detectClient();
       setClientStatus(status);
     } catch {
-      setClientStatus({ running: false });
+      setClientStatus({ running: false, versionId: null, mcVersion: null, loader: null, pid: null });
     } finally {
       setClientChecking(false);
     }
@@ -1612,30 +2157,45 @@ function App() {
   const overviewStatus = selectedServer ? serverStatusFor(selectedServer) : "STOPPED";
   const overviewAction = getActionState(overviewStatus as ServerStatus);
   const serverReady = overviewStatus === "RUNNING";
-  const serverLoader = selectedServer
-    ? selectedServer.server_type === "forge"
-      ? "forge"
-      : selectedServer.server_type === "fabric"
-      ? "fabric"
-      : "none"
-    : "none";
-  const clientLoader = clientStatus?.loader ?? "none";
+  const serverLoader = serverMetadata?.loader ??
+    (selectedServer
+      ? selectedServer.server_type === "forge"
+        ? "forge"
+        : selectedServer.server_type === "fabric"
+        ? "fabric"
+        : "vanilla"
+      : "vanilla");
+  const clientLoader = clientStatus?.loader ?? "vanilla";
   const clientVersion = clientStatus?.mcVersion ?? null;
-  const versionMismatch = Boolean(
-    selectedServer && clientStatus?.running && clientVersion && clientVersion !== selectedServer.version
-  );
-  const loaderMismatch = Boolean(
-    selectedServer && clientStatus?.running && clientLoader !== serverLoader && serverLoader !== "none"
-  );
+  const comparison = compareClientToServer(clientStatus, selectedServer);
+  const versionMismatch = Boolean(selectedServer && clientStatus?.running && !comparison.versionMatch);
+  const loaderMismatch = Boolean(selectedServer && clientStatus?.running && !comparison.loaderMatch);
   const supportsMods = Boolean(
     selectedServer && (selectedServer.server_type === "forge" || selectedServer.server_type === "fabric")
   );
   const modMismatch = Boolean(
-    supportsMods && modSync?.mods?.some((entry) => entry.status !== "installed")
+    supportsMods && modSync?.mods?.some((entry) => entry.status === "missing" || entry.status === "conflict")
   );
   const isCompatible = Boolean(
     clientStatus?.running && serverReady && !versionMismatch && !loaderMismatch && !modMismatch
   );
+
+  useEffect(() => {
+    if (!clientStatus?.running) {
+      setClientMismatchDismissed(false);
+      setClientMismatchOpen(false);
+      return;
+    }
+    const mismatch = versionMismatch || loaderMismatch;
+    if (!mismatch) {
+      setClientMismatchDismissed(false);
+      setClientMismatchOpen(false);
+      return;
+    }
+    if (!clientMismatchDismissed) {
+      setClientMismatchOpen(true);
+    }
+  }, [clientStatus, versionMismatch, loaderMismatch, clientMismatchDismissed]);
 
   const openAppData = async () => {
     const targetPath = appDataPath ?? "C:\\Users\\Adam\\AppData\\Roaming\\com.gamehost.one";
@@ -2071,7 +2631,157 @@ function App() {
             open={launcherChoiceOpen}
             onClose={() => setLauncherChoiceOpen(false)}
             onChoose={handleChooseLauncher}
+            launcherPath={effectiveAppSettings.launcher_path ?? null}
+            onPickLauncherPath={handlePickLauncherPath}
+            onClearLauncherPath={handleClearLauncherPath}
           />
+          {clientMismatchOpen && selectedServer && clientStatus?.running && (
+            <div className="fixed inset-0 z-60 flex items-center justify-center bg-black/60 px-6">
+              <div className="w-full max-w-sm rounded-3xl border border-white/10 bg-surface p-6 text-sm text-text shadow-soft">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.2em] text-muted">Compatibility</p>
+                    <h3 className="mt-2 font-display text-xl text-text">Incompatible client detected</h3>
+                  </div>
+                  <button
+                    className="rounded-full border border-white/10 px-3 py-1 text-xs text-muted transition hover:bg-white/10 hover:text-text"
+                    onClick={() => {
+                      setClientMismatchOpen(false);
+                      setClientMismatchDismissed(true);
+                    }}
+                  >
+                    Close
+                  </button>
+                </div>
+                <div className="mt-4 grid gap-2 rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
+                  <p className="text-xs uppercase tracking-[0.2em] text-muted">Server</p>
+                  <p className="text-sm text-text">
+                    {formatLoaderLabel(serverLoader)} {serverMetadata?.mcVersion ?? selectedServer.version}
+                  </p>
+                </div>
+                <div className="mt-3 grid gap-2 rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
+                  <p className="text-xs uppercase tracking-[0.2em] text-muted">Client</p>
+                  <p className="text-sm text-text">
+                    {formatLoaderLabel(clientLoader)} {clientVersion ?? "unknown"}
+                  </p>
+                </div>
+                <div className="mt-5 flex flex-wrap items-center gap-3">
+                  <PrimaryButton onClick={handleLaunchMinecraft}>Launch correct version</PrimaryButton>
+                  <SubtleButton
+                    onClick={() => {
+                      setClientMismatchDismissed(true);
+                      handleOpenLauncherOnly();
+                    }}
+                  >
+                    Open launcher
+                  </SubtleButton>
+                </div>
+              </div>
+            </div>
+          )}
+          {modSyncModalOpen && (
+            <div className="fixed inset-0 z-60 flex items-center justify-center bg-black/60 px-6">
+              <div className="w-full max-w-2xl rounded-3xl border border-white/10 bg-surface p-6 text-sm text-text shadow-soft">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.2em] text-muted">Mod sync</p>
+                    <h3 className="mt-2 font-display text-xl text-text">Mod list</h3>
+                  </div>
+                  <button
+                    className="rounded-full border border-white/10 px-3 py-1 text-xs text-muted transition hover:bg-white/10 hover:text-text"
+                    onClick={() => setModSyncModalOpen(false)}
+                  >
+                    Close
+                  </button>
+                </div>
+                {modpack && (
+                  <p className="mt-3 text-xs text-muted">
+                    Modpack: {modpack.mcVersion} · {formatLoaderLabel(modpack.loader)} · {modpack.mods.length} mods
+                  </p>
+                )}
+                {modSync?.mods?.some((entry) => entry.status === "unknown") && (
+                  <p className="mt-2 text-xs text-muted">Some mods do not include sync metadata.</p>
+                )}
+                <div className="mt-4 max-h-[60vh] overflow-y-auto pr-2">
+                  {modSync?.mods && modSync.mods.length > 0 ? (
+                    <div className="grid gap-2">
+                      {modSync.mods.map((entry) => (
+                        <div
+                          key={entry.id}
+                          className="flex items-center justify-between rounded-2xl border border-white/10 bg-white/5 px-3 py-2"
+                        >
+                          <div>
+                            <p className="text-sm text-text">{entry.id}</p>
+                            {entry.version !== "unknown" && (
+                              <p className="text-xs text-muted">{entry.version}</p>
+                            )}
+                          </div>
+                          {entry.status !== "unknown" && (
+                            <span
+                              className={classNames(
+                                "rounded-full px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.2em]",
+                                entry.status === "installed"
+                                  ? "bg-secondary/20 text-secondary"
+                                  : entry.status === "missing"
+                                  ? "bg-amber-500/20 text-amber-200"
+                                  : "bg-danger/20 text-danger"
+                              )}
+                            >
+                              {entry.status}
+                            </span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-xs text-muted">No modpack data yet.</p>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+          {modsModalOpen && (
+            <div className="fixed inset-0 z-60 flex items-center justify-center bg-black/60 px-6">
+              <div className="w-full max-w-2xl rounded-3xl border border-white/10 bg-surface p-6 text-sm text-text shadow-soft">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.2em] text-muted">Mods</p>
+                    <h3 className="mt-2 font-display text-xl text-text">Installed mods</h3>
+                  </div>
+                  <button
+                    className="rounded-full border border-white/10 px-3 py-1 text-xs text-muted transition hover:bg-white/10 hover:text-text"
+                    onClick={() => setModsModalOpen(false)}
+                  >
+                    Close
+                  </button>
+                </div>
+                <div className="mt-4 max-h-[60vh] overflow-y-auto pr-2">
+                  {modsLoading ? (
+                    <p className="text-xs text-muted">Loading mods...</p>
+                  ) : mods.length === 0 ? (
+                    <p className="text-xs text-muted">No mods installed yet.</p>
+                  ) : (
+                    <div className="grid gap-2">
+                      {mods.map((entry) => (
+                        <div
+                          key={entry.file_name}
+                          className="flex items-center justify-between rounded-2xl border border-white/10 bg-white/5 px-4 py-2"
+                        >
+                          <div>
+                            <p className="text-sm text-text">{entry.name}</p>
+                            <p className="text-xs text-muted">{entry.enabled ? "Enabled" : "Disabled"}</p>
+                          </div>
+                          <SubtleButton onClick={() => handleToggleMod(entry)}>
+                            {entry.enabled ? "Disable" : "Enable"}
+                          </SubtleButton>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
           {joinHelpOpen && (
             <div className="fixed inset-0 z-60 flex items-center justify-center bg-black/60 px-6">
               <div className="w-full max-w-sm rounded-3xl border border-white/10 bg-surface p-6 text-sm text-text shadow-soft">
@@ -2492,18 +3202,13 @@ function App() {
                     </div>
                   </div>
                   <div className="flex items-center gap-3">
-                    <SubtleButton onClick={() => setImportOpen(true)}>Import existing server</SubtleButton>
-                    <PrimaryButton
-                      onClick={() => {
-                        setView("wizard");
-                        if (tutorialActive && activeTutorialStep?.id === "create") {
-                          nextTutorial();
-                        }
-                      }}
-                      data-tutorial="create-server"
-                    >
-                      Create Server
-                    </PrimaryButton>
+                    <CreateServerMenu
+                      label="Create Server"
+                      onCreate={handleOpenWizard}
+                      onImport={() => setImportOpen(true)}
+                      onMigrate={() => setView("migration")}
+                      dataTutorial="create-server"
+                    />
                   </div>
                 </motion.header>
 
@@ -2513,7 +3218,12 @@ function App() {
                       <div className="flex flex-col gap-4">
                         <h2 className="font-display text-xl text-text">No servers yet</h2>
                         <p className="text-sm text-muted">Create your first Minecraft server in minutes.</p>
-                        <PrimaryButton onClick={() => setView("wizard")}>Create your first server</PrimaryButton>
+                        <CreateServerMenu
+                          label="Create your first server"
+                          onCreate={handleOpenWizard}
+                          onImport={() => setImportOpen(true)}
+                          onMigrate={() => setView("migration")}
+                        />
                       </div>
                     </Card>
                   ) : (
@@ -2635,6 +3345,43 @@ function App() {
               </motion.div>
             )}
 
+            {view === "migration" && (
+              <motion.div
+              key="migration"
+              variants={container}
+              initial="hidden"
+              animate="show"
+              exit={{ opacity: 0 }}
+              className="mx-auto flex w-full max-w-5xl flex-col gap-8"
+            >
+              <motion.header variants={item} className="flex flex-wrap items-center gap-4">
+                <button
+                  className="rounded-full bg-white/10 px-3 py-2 text-xs font-semibold text-text transition hover:bg-white/20"
+                  onClick={() => setView("servers")}
+                >
+                  Back
+                </button>
+                <div className="flex items-center gap-3">
+                  <img src="/MC-logo.webp" alt="Minecraft" className="h-12 w-12 object-contain" />
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.3em] text-muted">Minecraft</p>
+                    <h1 className="font-display text-3xl text-text">Migration Wizard</h1>
+                  </div>
+                </div>
+              </motion.header>
+
+              <motion.div variants={item}>
+                <MigrationWizard
+                  systemRamGb={systemRamGb}
+                  safeRamMaxGb={safeRamMaxGb}
+                  recommendedRamGb={recommendedRamGb}
+                  onBack={() => setView("servers")}
+                  onCreate={handleMigrationCreate}
+                />
+              </motion.div>
+              </motion.div>
+            )}
+
             {view === "wizard" && (
               <motion.div
               key="wizard"
@@ -2687,6 +3434,7 @@ function App() {
                             side="bottom"
                             align="start"
                             sideOffset={8}
+                            avoidCollisions={false}
                             className="select-content z-50 overflow-hidden rounded-2xl border border-white/10 shadow-soft"
                           >
                             <Select.Viewport className="bg-surface p-1">
@@ -2717,6 +3465,7 @@ function App() {
                               side="bottom"
                               align="start"
                               sideOffset={8}
+                              avoidCollisions={false}
                               className="select-content z-50 overflow-hidden rounded-2xl border border-white/10 shadow-soft"
                             >
                             <div className="border-b border-white/10 bg-surface/95 p-2">
@@ -2730,7 +3479,7 @@ function App() {
                             </div>
                             {wizardVersionLimitHit && (
                               <div className="border-b border-white/10 bg-surface/95 px-3 py-2 text-[10px] text-muted">
-                                Showing first {MAX_VERSION_OPTIONS} versions. Type to search more.
+                                Showing first {wizardVersionLimit} versions. Type to search more.
                               </div>
                             )}
                             <Select.Viewport className="bg-surface p-1">
@@ -2762,6 +3511,32 @@ function App() {
                         </Select.Portal>
                       </Select.Root>
                     </div>
+                    <WorldStep
+                      mode={wizardWorldMode}
+                      sourcePath={wizardWorldSource}
+                      validation={wizardWorldValidation}
+                      error={wizardWorldError}
+                      busy={wizardWorldBusy}
+                      copyProgress={wizardWorldCopy}
+                      copyDone={wizardWorldCopied}
+                      onModeChange={handleWorldModeChange}
+                      onPickFolder={() => handlePickWorld("folder")}
+                      onPickZip={() => handlePickWorld("zip")}
+                      onClear={handleClearWorld}
+                    />
+                    {wizardType === "forge" && (
+                      <ModsStep
+                        mode={wizardModsMode}
+                        sourcePath={wizardModsSource}
+                        validation={wizardModsValidation}
+                        error={wizardModsError}
+                        busy={wizardModsBusy}
+                        onModeChange={handleModsModeChange}
+                        onPickFolder={() => handlePickMods("folder")}
+                        onPickZip={() => handlePickMods("zip")}
+                        onClear={handleClearMods}
+                      />
+                    )}
                     <div className="grid gap-2">
                       <label className="text-xs uppercase tracking-[0.2em] text-muted">Gameplay</label>
                       <ServerSettingsFields
@@ -2775,24 +3550,35 @@ function App() {
                       <p className="text-xs text-muted">Controls how much memory the server can use.</p>
                       {systemRamGb && (
                         <p className="text-xs text-muted">
-                          You have {systemRamGb} GB RAM — we recommend {recommendedRamGb ?? systemRamGb} GB.
+                          You have {systemRamGb} GB RAM — we recommend{" "}
+                          <span className="font-semibold text-one">
+                            {wizardRecommendedRamGb ?? recommendedRamGb ?? systemRamGb} GB
+                          </span>
+                          .
                         </p>
                       )}
+                      {wizardRam === wizardRecommendedRamGb && wizardRecommendedRamGb && (
+                        <p className="text-xs text-muted">Recommended RAM selected.</p>
+                      )}
                       <div className="flex flex-wrap gap-2">
-                        {ramOptions.map((ram) => (
+                        {wizardRamOptions.map((ram) => (
                           <button
                             key={ram}
                             className={classNames(
-                              "rounded-full px-4 py-2 text-sm font-semibold transition",
-                              wizardRam === ram ? "bg-one text-white" : "bg-white/10 text-text hover:bg-white/20"
+                              "flex items-center gap-2 rounded-full px-4 py-2 text-sm font-semibold transition",
+                              wizardRam === ram
+                                ? "bg-one text-white"
+                                : "bg-white/10 text-text hover:bg-white/20",
+                              ram === wizardRecommendedRamGb && wizardRam !== ram ? "ring-1 ring-one/40" : ""
                             )}
                             onClick={() => {
                               setWizardRam(ram);
                               setRamManualInput(String(ram));
+                              setWizardRamAuto(false);
                             }}
                             type="button"
                           >
-                            {ram} GB
+                            <span>{ram} GB</span>
                           </button>
                         ))}
                       </div>
@@ -2800,6 +3586,18 @@ function App() {
                         <SubtleButton onClick={() => setRamManualOpen((prev) => !prev)}>
                           {ramManualOpen ? "Hide manual input" : "Choose RAM allocation manually"}
                         </SubtleButton>
+                        {wizardRecommendedRamGb && !wizardRamAuto && (
+                          <SubtleButton
+                            className="bg-one/20 text-one ring-1 ring-one/40 hover:bg-one/25"
+                            onClick={() => {
+                              setWizardRamAuto(true);
+                              setWizardRam(wizardRecommendedRamGb);
+                              setRamManualInput(String(wizardRecommendedRamGb));
+                            }}
+                          >
+                            Use recommended
+                          </SubtleButton>
+                        )}
                         <span className="text-xs text-muted">Min 1 GB · Max {safeRamMaxGb} GB</span>
                       </div>
                       {ramManualOpen && (
@@ -2814,6 +3612,7 @@ function App() {
                               const next = Math.max(1, Math.min(safeRamMaxGb, Number.isFinite(raw) ? raw : 1));
                               setRamManualInput(event.target.value);
                               setWizardRam(next);
+                              setWizardRamAuto(false);
                             }}
                             className="w-24 rounded-full border border-white/10 bg-white/10 px-3 py-2 text-xs font-semibold text-text focus:border-one/60 focus:outline-none"
                           />
@@ -2845,7 +3644,16 @@ function App() {
                       </div>
                     </div>
                     <div className="flex flex-wrap items-center gap-3">
-                      <PrimaryButton onClick={handleCreateServer} disabled={installing}>
+                      <PrimaryButton
+                        onClick={handleCreateServer}
+                        disabled={
+                          installing ||
+                          !wizardWorldReady ||
+                          !wizardModsReady ||
+                          wizardWorldBusy ||
+                          wizardModsBusy
+                        }
+                      >
                         {installing ? "Installing..." : "Create Server"}
                       </PrimaryButton>
                       <SubtleButton onClick={() => setWizardAdvancedOpen(true)}>Advanced settings</SubtleButton>
@@ -2906,7 +3714,12 @@ function App() {
                     <p className="text-xs uppercase tracking-[0.3em] text-muted">Minecraft</p>
                     <h1 className="font-display text-3xl text-text">{selectedServer.name}</h1>
                     <p className="text-xs text-muted">
-                      {getServerTypeLabel(selectedServer.server_type).toUpperCase()} · Version {selectedServer.version} · RAM {selectedServer.ram_gb} GB
+                      {formatLoaderLabel(serverMetadata?.loader ?? getServerTypeLabel(selectedServer.server_type))}{" "}
+                      {serverMetadata?.mcVersion && serverMetadata.mcVersion !== "unknown"
+                        ? serverMetadata.mcVersion
+                        : selectedServer.version}
+                      {" · RAM "}{selectedServer.ram_gb} GB
+                      {serverMetadata?.modCount ? ` · ${serverMetadata.modCount} Mods Detected` : ""}
                     </p>
                   </div>
                 </div>
@@ -3208,6 +4021,12 @@ function App() {
                               </span>
                             ) : clientChecking ? (
                               <span className="text-xs text-muted">Checking for Minecraft...</span>
+                            ) : clientStatus?.mcVersion ? (
+                              <span className="text-xs text-muted">
+                                Last detected ({formatLoaderLabel(clientStatus.loader ?? "vanilla")} {clientStatus.mcVersion})
+                              </span>
+                            ) : launcherOpenedAt ? (
+                              <span className="text-xs text-muted">Launcher opened. Start the game to detect client.</span>
                             ) : (
                               <span className="text-xs text-muted">Minecraft not detected</span>
                             )}
@@ -3252,6 +4071,18 @@ function App() {
                             Change launcher
                           </SubtleButton>
                         </div>
+                        {selectedServer?.server_type === "forge" && (
+                          <div className="flex flex-wrap items-center gap-2">
+                            <SubtleButton onClick={handleOpenForgeDownload}>
+                              Open Forge installer page
+                            </SubtleButton>
+                          </div>
+                        )}
+                        {selectedServer && (
+                          <p className="text-xs text-muted">
+                            Required: {selectedServer.version} · {getServerTypeLabel(selectedServer.server_type)}. Use Launch Minecraft to open the launcher.
+                          </p>
+                        )}
 
                         {(versionMismatch || loaderMismatch) && clientStatus?.running && (
                           <div className="flex flex-wrap items-center gap-2">
@@ -3275,7 +4106,16 @@ function App() {
                                 <SubtleButton onClick={handleSyncModsCheck} disabled={modSyncLoading}>
                                   {modSyncLoading ? "Checking..." : "Check"}
                                 </SubtleButton>
-                                <SubtleButton onClick={openClientModsFolder}>Open mods folder</SubtleButton>
+                                <button
+                                  className="flex items-center gap-2 text-xs font-semibold text-muted transition hover:text-text"
+                                  onClick={openClientModsFolder}
+                                  type="button"
+                                >
+                                  <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                    <path d="M3 7h5l2 2h11v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
+                                  </svg>
+                                  Server mods
+                                </button>
                               </div>
                             </div>
                             {modpack && (
@@ -3284,33 +4124,17 @@ function App() {
                               </p>
                             )}
                             {modSync?.mods && modSync.mods.length > 0 ? (
-                              <div className="mt-3 grid gap-2">
-                                {modSync.mods.map((entry) => (
-                                  <div
-                                    key={entry.id}
-                                    className="flex items-center justify-between rounded-2xl border border-white/10 bg-white/5 px-3 py-2"
-                                  >
-                                    <div>
-                                      <p className="text-sm text-text">{entry.id}</p>
-                                      <p className="text-xs text-muted">{entry.version}</p>
-                                    </div>
-                                    <span
-                                      className={classNames(
-                                        "rounded-full px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.2em]",
-                                        entry.status === "installed"
-                                          ? "bg-secondary/20 text-secondary"
-                                          : entry.status === "missing"
-                                          ? "bg-amber-500/20 text-amber-200"
-                                          : "bg-danger/20 text-danger"
-                                      )}
-                                    >
-                                      {entry.status}
-                                    </span>
-                                  </div>
-                                ))}
+                              <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
+                                <p className="text-xs text-muted">Mods: {modSync.mods.length}</p>
+                                <SubtleButton onClick={() => setModSyncModalOpen(true)}>View mod list</SubtleButton>
                               </div>
                             ) : (
                               <p className="mt-3 text-xs text-muted">No modpack data yet.</p>
+                            )}
+                            {modSync?.mods?.some((entry) => entry.status === "unknown") && (
+                              <p className="mt-3 text-xs text-muted">
+                                Client mods were not detected. If you use CurseForge or a custom profile, sync is unavailable.
+                              </p>
                             )}
                           </div>
                         )}
@@ -3433,6 +4257,7 @@ function App() {
                                   side="bottom"
                                   align="start"
                                   sideOffset={8}
+                                  avoidCollisions={false}
                                   className="select-content z-50 overflow-hidden rounded-2xl border border-white/10 shadow-soft"
                                 >
                                   <Select.Viewport className="bg-surface p-1">
@@ -3504,16 +4329,20 @@ function App() {
                           <p className="text-xs uppercase tracking-[0.2em] text-muted">RAM Allocation</p>
                           {systemRamGb && (
                             <p className="mt-2 text-xs text-muted">
-                              You have {systemRamGb} GB RAM — we recommend {recommendedRamGb ?? systemRamGb} GB.
+                              You have {systemRamGb} GB RAM — we recommend {serverRecommendedRamGb ?? recommendedRamGb ?? systemRamGb} GB.
                             </p>
                           )}
+                          {ramDraft === serverRecommendedRamGb && serverRecommendedRamGb && (
+                            <p className="mt-2 text-xs text-muted">Recommended RAM selected.</p>
+                          )}
                           <div className="mt-3 flex flex-wrap gap-2">
-                            {ramOptions.map((ram) => (
+                            {serverRamOptions.map((ram) => (
                               <button
                                 key={ram}
                                 className={classNames(
-                                  "rounded-full px-4 py-2 text-sm font-semibold transition",
-                                  ramDraft === ram ? "bg-one text-white" : "bg-white/10 text-text hover:bg-white/20"
+                                  "flex items-center gap-2 rounded-full px-4 py-2 text-sm font-semibold transition",
+                                  ramDraft === ram ? "bg-one text-white" : "bg-white/10 text-text hover:bg-white/20",
+                                  ram === serverRecommendedRamGb && ramDraft !== ram ? "ring-1 ring-one/40" : ""
                                 )}
                                 onClick={() => {
                                   setRamDraft(ram);
@@ -3521,7 +4350,7 @@ function App() {
                                 }}
                                 type="button"
                               >
-                                {ram} GB
+                                <span>{ram} GB</span>
                               </button>
                             ))}
                           </div>
@@ -3529,6 +4358,17 @@ function App() {
                             <SubtleButton onClick={() => setRamManualOpen((prev) => !prev)}>
                               {ramManualOpen ? "Hide manual input" : "Choose RAM allocation manually"}
                             </SubtleButton>
+                            {serverRecommendedRamGb && ramDraft !== serverRecommendedRamGb && (
+                              <SubtleButton
+                                className="bg-one/20 text-one ring-1 ring-one/40 hover:bg-one/25"
+                                onClick={() => {
+                                  setRamDraft(serverRecommendedRamGb);
+                                  setRamManualInput(String(serverRecommendedRamGb));
+                                }}
+                              >
+                                Use recommended
+                              </SubtleButton>
+                            )}
                             <span className="text-xs text-muted">Min 1 GB · Max {safeRamMaxGb} GB</span>
                           </div>
                           {ramManualOpen && (
@@ -3553,8 +4393,8 @@ function App() {
                           )}
                         </div>
                         <div className="flex items-center justify-between">
-                          <p className="text-xs text-muted">Apply RAM changes (restart required).</p>
-                          <PrimaryButton onClick={handleSaveConfig} disabled={configSaving}>
+                          <p className="text-xs text-muted">Apply RAM changes (backup + restart if running).</p>
+                          <PrimaryButton onClick={handleApplyRam} disabled={configSaving}>
                             {configSaving ? "Saving..." : "Apply RAM"}
                           </PrimaryButton>
                         </div>
@@ -3582,7 +4422,14 @@ function App() {
                               <Select.Icon className="text-muted">▾</Select.Icon>
                             </Select.Trigger>
                             <Select.Portal>
-                              <Select.Content className="select-content z-50 overflow-hidden rounded-2xl border border-white/10 shadow-soft">
+                              <Select.Content
+                                position="popper"
+                                side="bottom"
+                                align="start"
+                                sideOffset={8}
+                                avoidCollisions={false}
+                                className="select-content z-50 overflow-hidden rounded-2xl border border-white/10 shadow-soft"
+                              >
                                 <Select.Viewport className="bg-surface p-1">
                                   {SERVER_TYPES.map((type) => (
                                     <Select.Item
@@ -3606,7 +4453,14 @@ function App() {
                               <Select.Icon className="text-muted">▾</Select.Icon>
                             </Select.Trigger>
                             <Select.Portal>
-                              <Select.Content className="select-content z-50 overflow-hidden rounded-2xl border border-white/10 shadow-soft">
+                              <Select.Content
+                                position="popper"
+                                side="bottom"
+                                align="start"
+                                sideOffset={8}
+                                avoidCollisions={false}
+                                className="select-content z-50 overflow-hidden rounded-2xl border border-white/10 shadow-soft"
+                              >
                                 <div className="border-b border-white/10 bg-surface/95 p-2">
                                   <input
                                     className="w-full rounded-full border border-white/10 bg-white/10 px-3 py-2 text-xs text-text focus:border-one/60 focus:outline-none"
@@ -3618,7 +4472,7 @@ function App() {
                                 </div>
                                 {reinstallVersionLimitHit && (
                                   <div className="border-b border-white/10 bg-surface/95 px-3 py-2 text-[10px] text-muted">
-                                    Showing first {MAX_VERSION_OPTIONS} versions. Type to search more.
+                                    Showing first {reinstallVersionLimit} versions. Type to search more.
                                   </div>
                                 )}
                                 <Select.Viewport className="bg-surface p-1">
@@ -3797,21 +4651,9 @@ function App() {
                           ) : mods.length === 0 ? (
                             <p className="text-xs text-muted">No mods installed yet.</p>
                           ) : (
-                            <div className="grid gap-2">
-                              {mods.map((entry) => (
-                                <div
-                                  key={entry.file_name}
-                                  className="flex items-center justify-between rounded-2xl border border-white/10 bg-white/5 px-4 py-2"
-                                >
-                                  <div>
-                                    <p className="text-sm text-text">{entry.name}</p>
-                                    <p className="text-xs text-muted">{entry.enabled ? "Enabled" : "Disabled"}</p>
-                                  </div>
-                                  <SubtleButton onClick={() => handleToggleMod(entry)}>
-                                    {entry.enabled ? "Disable" : "Enable"}
-                                  </SubtleButton>
-                                </div>
-                              ))}
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <p className="text-xs text-muted">Mods: {mods.length}</p>
+                              <SubtleButton onClick={() => setModsModalOpen(true)}>View mod list</SubtleButton>
                             </div>
                           )}
                         </div>
