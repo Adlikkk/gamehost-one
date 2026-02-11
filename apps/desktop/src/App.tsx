@@ -1,5 +1,5 @@
 import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
-import type { DragEvent, ReactNode } from "react";
+import type { DragEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { appDataDir, dataDir, join } from "@tauri-apps/api/path";
@@ -14,14 +14,19 @@ import * as Switch from "@radix-ui/react-switch";
 import * as Select from "@radix-ui/react-select";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { BrandName } from "./components/BrandName";
+import { ServerSettingsFields } from "./components/ServerSettingsFields";
+import { PrimaryButton, SubtleButton } from "./components/ui/Buttons";
+import { Card } from "./components/ui/Card";
+import { SegmentedBar } from "./components/ui/SegmentedBar";
+import { SettingRow } from "./components/ui/SettingRow";
+import { StatusPill } from "./components/ui/StatusPill";
+import { classNames } from "./utils/classNames";
 import type {
   AppSettings,
   ApplyResult,
   BackupEntry,
   CrashReport,
   CrashReportSummary,
-  Difficulty,
-  GameMode,
   ImportAnalysis,
   JavaStatusResult,
   LauncherChoice,
@@ -207,10 +212,6 @@ const TUTORIAL_STEPS: TutorialStep[] = [
   }
 ];
 
-const DIFFICULTY_OPTIONS: Difficulty[] = ["Peaceful", "Easy", "Normal", "Hard"];
-
-const GAMEMODE_OPTIONS: GameMode[] = ["Survival", "Creative", "Adventure", "Spectator"];
-
 const DEFAULT_SETTINGS: ServerSettings = {
   sleepPlayers: 1,
   difficulty: "Normal",
@@ -236,13 +237,6 @@ const container = {
 
 const item = { hidden: { opacity: 0, y: 16 }, show: { opacity: 1, y: 0 } };
 
-const statusMeta: Record<ServerStatus, { label: string; pill: string; dot: string; text: string }> = {
-  STOPPED: { label: "Stopped", pill: "bg-danger/20", dot: "bg-danger", text: "text-danger" },
-  STARTING: { label: "", pill: "bg-primary/20", dot: "bg-primary", text: "text-primary" },
-  RUNNING: { label: "Running", pill: "bg-secondary/20", dot: "bg-secondary", text: "text-secondary" },
-  ERROR: { label: "Error", pill: "bg-danger/15", dot: "bg-danger", text: "text-danger" }
-};
-
 const getActionState = (status: ServerStatus) => {
   const starting = status === "STARTING";
   return {
@@ -260,10 +254,6 @@ const normalizeStatus = (value: string): ServerStatus => {
   }
   return "STOPPED";
 };
-
-function classNames(...values: Array<string | false | null | undefined>) {
-  return values.filter(Boolean).join(" ");
-}
 
 function getServerTypeLabel(value: ServerConfig["server_type"]) {
   return (
@@ -310,248 +300,6 @@ function trimVersionGroups(groups: VersionGroup[], term: string) {
     .filter((group) => group.versions.length > 0);
 }
 
-function Card({ title, action, children }: { title?: string; action?: ReactNode; children: ReactNode }) {
-  return (
-    <div className="rounded-3xl bg-surface shadow-soft ring-1 ring-white/5">
-      {title && (
-        <div className="flex items-center justify-between gap-4 border-b border-white/5 px-6 py-4">
-          <h3 className="font-display text-lg text-text">{title}</h3>
-          {action}
-        </div>
-      )}
-      <div className="px-6 py-5">{children}</div>
-    </div>
-  );
-}
-
-function SubtleButton({
-  onClick,
-  children,
-  disabled,
-  className
-}: {
-  onClick?: React.MouseEventHandler<HTMLButtonElement>;
-  children: ReactNode;
-  disabled?: boolean;
-  className?: string;
-}) {
-  return (
-    <button
-      className={classNames(
-        "rounded-full bg-white/10 px-4 py-2 text-xs font-semibold text-text transition hover:-translate-y-0.5 hover:bg-white/20 hover:shadow-soft",
-        "disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-white/10",
-        className
-      )}
-      onClick={onClick}
-      disabled={disabled}
-    >
-      {children}
-    </button>
-  );
-}
-
-function PrimaryButton({
-  onClick,
-  children,
-  disabled,
-  className
-}: {
-  onClick?: () => void;
-  children: ReactNode;
-  disabled?: boolean;
-  className?: string;
-}) {
-  return (
-    <button
-      className={classNames(
-        "rounded-full bg-one px-5 py-2 text-sm font-semibold text-white shadow-soft transition hover:-translate-y-0.5 hover:bg-one/90 hover:shadow-[0_10px_30px_rgba(79,209,197,0.2)] disabled:cursor-not-allowed disabled:opacity-70",
-        className
-      )}
-      onClick={onClick}
-      disabled={disabled}
-    >
-      {children}
-    </button>
-  );
-}
-
-function StatusPill({ status }: { status: ServerStatus | string }) {
-  const meta = statusMeta[status as ServerStatus] ?? statusMeta.STOPPED;
-  return (
-    <span className={classNames("flex items-center gap-2 rounded-full px-3 py-1 text-xs font-semibold", meta.pill, meta.text)}>
-      <motion.span
-        className={classNames("h-2 w-2 rounded-full", meta.dot)}
-        animate={status === "STARTING" ? { opacity: [0.4, 1, 0.4], scale: [0.9, 1.1, 0.9] } : undefined}
-        transition={status === "STARTING" ? { repeat: Infinity, duration: 1.2 } : undefined}
-      />
-      {meta.label && <span className="font-semibold">{meta.label}</span>}
-    </span>
-  );
-}
-
-function SegmentedBar({
-  value,
-  tone,
-  pulse
-}: {
-  value: number;
-  tone: "primary" | "secondary" | "danger";
-  pulse?: boolean;
-}) {
-  const barTone = {
-    primary: "bg-one",
-    secondary: "bg-secondary",
-    danger: "bg-danger"
-  }[tone];
-
-  return (
-    <div className="h-3 overflow-hidden rounded-full bg-white/10">
-      <motion.div
-        className={classNames("h-full segmented-bar", barTone, pulse && "animate-pulse")}
-        initial={false}
-        animate={{ width: `${Math.min(100, value)}%` }}
-        transition={{ duration: 0.6, ease: "easeOut" }}
-      />
-    </div>
-  );
-}
-
-function SettingRow({
-  label,
-  description,
-  children
-}: {
-  label: string;
-  description?: string;
-  children: ReactNode;
-}) {
-  return (
-    <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
-      <div>
-        <p className="text-sm font-semibold text-text">{label}</p>
-        {description && <p className="text-xs text-muted">{description}</p>}
-      </div>
-      <div className="flex items-center gap-3">{children}</div>
-    </div>
-  );
-}
-
-function ServerSettingsFields({
-  settings,
-  onChange,
-  variant
-}: {
-  settings: ServerSettings;
-  onChange: (next: ServerSettings) => void;
-  variant: "basic" | "advanced" | "all";
-}) {
-  const update = (patch: Partial<ServerSettings>) => onChange({ ...settings, ...patch });
-
-  return (
-    <div className="grid gap-4">
-      {(variant === "basic" || variant === "all") && (
-        <>
-          <SettingRow label="Difficulty" description="Choose how challenging mobs and survival will feel.">
-            <Select.Root value={settings.difficulty} onValueChange={(value) => update({ difficulty: value as Difficulty })}>
-              <Select.Trigger className="flex w-44 items-center justify-between rounded-full border border-white/10 bg-white/10 px-4 py-2 text-xs font-semibold text-text transition focus:border-one/60 focus:outline-none">
-                <Select.Value />
-                <Select.Icon className="text-muted">▾</Select.Icon>
-              </Select.Trigger>
-              <Select.Portal>
-                <Select.Content className="select-content z-50 overflow-hidden rounded-2xl border border-white/10 shadow-soft">
-                  <Select.Viewport className="bg-surface p-1">
-                    {DIFFICULTY_OPTIONS.map((level) => (
-                      <Select.Item
-                        key={level}
-                        value={level}
-                        className="cursor-pointer rounded-xl px-3 py-2 text-sm text-text outline-none data-highlighted:bg-white/15 data-highlighted:text-white"
-                      >
-                        <Select.ItemText>{level}</Select.ItemText>
-                      </Select.Item>
-                    ))}
-                  </Select.Viewport>
-                </Select.Content>
-              </Select.Portal>
-            </Select.Root>
-          </SettingRow>
-          <SettingRow label="Game mode" description="Set the default mode for new players.">
-            <Select.Root value={settings.gameMode} onValueChange={(value) => update({ gameMode: value as GameMode })}>
-              <Select.Trigger className="flex w-44 items-center justify-between rounded-full border border-white/10 bg-white/10 px-4 py-2 text-xs font-semibold text-text transition focus:border-one/60 focus:outline-none">
-                <Select.Value />
-                <Select.Icon className="text-muted">▾</Select.Icon>
-              </Select.Trigger>
-              <Select.Portal>
-                <Select.Content className="select-content z-50 overflow-hidden rounded-2xl border border-white/10 shadow-soft">
-                  <Select.Viewport className="bg-surface p-1">
-                    {GAMEMODE_OPTIONS.map((mode) => (
-                      <Select.Item
-                        key={mode}
-                        value={mode}
-                        className="cursor-pointer rounded-xl px-3 py-2 text-sm text-text outline-none data-highlighted:bg-white/15 data-highlighted:text-white"
-                      >
-                        <Select.ItemText>{mode}</Select.ItemText>
-                      </Select.Item>
-                    ))}
-                  </Select.Viewport>
-                </Select.Content>
-              </Select.Portal>
-            </Select.Root>
-          </SettingRow>
-          <SettingRow label="PvP" description="Allow player-versus-player combat.">
-            <Switch.Root
-              checked={settings.pvp}
-              onCheckedChange={(value) => update({ pvp: value })}
-              className="relative h-6 w-11 rounded-full bg-white/15 transition data-[state=checked]:bg-one"
-            >
-              <Switch.Thumb className="block h-5 w-5 translate-x-0.5 rounded-full bg-white transition data-[state=checked]:translate-x-5" />
-            </Switch.Root>
-          </SettingRow>
-          <SettingRow label="Max players" description="How many players can join at once.">
-            <input
-              type="number"
-              min={1}
-              max={200}
-              value={settings.maxPlayers}
-              onChange={(event) =>
-                update({ maxPlayers: Math.max(1, Math.min(200, Number(event.target.value) || 1)) })
-              }
-              className="w-24 rounded-full border border-white/10 bg-white/10 px-3 py-2 text-xs font-semibold text-text focus:border-one/60 focus:outline-none"
-            />
-          </SettingRow>
-        </>
-      )}
-
-      {(variant === "advanced" || variant === "all") && (
-        <>
-          <SettingRow label="Required sleeping players" description="How many players must sleep to skip the night.">
-            <input
-              type="number"
-              min={1}
-              max={10}
-              value={settings.sleepPlayers}
-              onChange={(event) =>
-                update({ sleepPlayers: Math.max(1, Math.min(10, Number(event.target.value) || 1)) })
-              }
-              className="w-20 rounded-full border border-white/10 bg-white/10 px-3 py-2 text-xs font-semibold text-text focus:border-one/60 focus:outline-none"
-            />
-          </SettingRow>
-          <SettingRow label="View distance" description="How far players can see chunks.">
-            <input
-              type="number"
-              min={4}
-              max={32}
-              value={settings.viewDistance}
-              onChange={(event) =>
-                update({ viewDistance: Math.max(4, Math.min(32, Number(event.target.value) || 4)) })
-              }
-              className="w-20 rounded-full border border-white/10 bg-white/10 px-3 py-2 text-xs font-semibold text-text focus:border-one/60 focus:outline-none"
-            />
-          </SettingRow>
-        </>
-      )}
-    </div>
-  );
-}
 
 function App() {
   const [view, setView] = useState<View>("loading");
