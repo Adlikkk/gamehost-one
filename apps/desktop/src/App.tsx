@@ -14,6 +14,13 @@ import * as Switch from "@radix-ui/react-switch";
 import * as Select from "@radix-ui/react-select";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { BrandName } from "./components/BrandName";
+import { TitleBar } from "./components/layout/TitleBar";
+import { Sidebar } from "./components/layout/Sidebar";
+import { CrashModal } from "./components/modals/CrashModal";
+import { DeleteServerModal } from "./components/modals/DeleteServerModal";
+import { ImportServerModal } from "./components/modals/ImportServerModal";
+import { JavaModal } from "./components/modals/JavaModal";
+import { LauncherModal } from "./components/modals/LauncherModal";
 import { ServerSettingsFields } from "./components/ServerSettingsFields";
 import { PrimaryButton, SubtleButton } from "./components/ui/Buttons";
 import { Card } from "./components/ui/Card";
@@ -1924,214 +1931,22 @@ function App() {
           isMaximized && "maximized"
         )}
       >
-        <header className="titlebar relative flex items-center justify-between border-b border-white/10 px-5 py-3">
-          <div className="flex items-center gap-3">
-          <img src="/logo.png" alt="Gamehost ONE" className="h-7 w-7 rounded-lg" />
-          <BrandName className="text-sm font-semibold" />
-        </div>
-        <div className="flex items-center gap-2">
-          <button
-            className="no-drag flex h-8 w-8 items-center justify-center rounded-full border border-white/10 text-muted transition hover:bg-white/10 hover:text-text"
-            onClick={handleMinimize}
-            aria-label="Minimize"
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-              <path d="M6 12h12" />
-            </svg>
-          </button>
-          <button
-            className="no-drag flex h-8 w-8 items-center justify-center rounded-full border border-white/10 text-muted transition hover:bg-white/10 hover:text-text"
-            onClick={handleMaximize}
-            aria-label="Maximize"
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-              <rect x="6" y="6" width="12" height="12" rx="2" />
-            </svg>
-          </button>
-          <button
-            className="no-drag flex h-8 w-8 items-center justify-center rounded-full border border-white/10 text-muted transition hover:border-danger/40 hover:bg-danger/40 hover:text-white"
-            onClick={handleClose}
-            aria-label="Close"
-          >
-            <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-              <path d="M7 7l10 10" />
-              <path d="M17 7l-10 10" />
-            </svg>
-          </button>
-        </div>
-        <AnimatePresence>
-          {uiToast && (
-            <motion.div
-              className="no-drag pointer-events-none absolute left-1/2 top-3 flex -translate-x-1/2 items-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 py-2 text-xs text-text"
-              initial={{ opacity: 0, y: -6 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -6 }}
-              transition={{ duration: 0.25 }}
-            >
-              {uiToast.label === "Welcome" ? (
-                <span className="text-text">{uiToast.message}</span>
-              ) : (
-                <>
-                  <span
-                    className={classNames(
-                      "flex h-6 w-6 items-center justify-center rounded-full",
-                      uiToast.tone === "success" ? "bg-secondary/20 text-secondary" : "bg-danger/20 text-danger"
-                    )}
-                  >
-                    {uiToast.tone === "success" ? (
-                      <svg aria-hidden="true" viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                        <path d="M20 6L9 17l-5-5" />
-                      </svg>
-                    ) : (
-                      <svg aria-hidden="true" viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                        <path d="M12 9v4" />
-                        <path d="M12 17h.01" />
-                        <circle cx="12" cy="12" r="9" />
-                      </svg>
-                    )}
-                  </span>
-                  <span className="uppercase tracking-[0.2em] text-muted">
-                    {uiToast.label ?? (uiToast.tone === "success" ? "Server" : "Notice")}
-                  </span>
-                  <span className="text-text">{uiToast.message}</span>
-                </>
-              )}
-            </motion.div>
-          )}
-        </AnimatePresence>
-        </header>
+        <TitleBar uiToast={uiToast} onMinimize={handleMinimize} onMaximize={handleMaximize} onClose={handleClose} />
 
         <div className="flex flex-1 min-h-0">
           {showSidebar && (
-            <aside
-              className={classNames(
-                "flex min-h-full flex-col border-r border-white/5 bg-surface/80 backdrop-blur",
-                sidebarExpanded ? "w-64" : "w-20",
-                "transition-[width] duration-300"
-              )}
-            >
-            {sidebarExpanded ? (
-              <div className="mt-4 px-3 text-[11px] uppercase tracking-[0.2em] text-muted">Home</div>
-            ) : null}
-            <nav className="mt-2 flex flex-col gap-1 px-2">
-              <button
-                className={classNames(
-                  "flex w-full items-center rounded-xl py-2 text-sm transition whitespace-nowrap",
-                  view === "library" ? "bg-white/10 text-one" : "text-muted hover:bg-white/10",
-                  sidebarExpanded ? "px-3 gap-3" : "justify-center px-2 gap-0"
-                )}
-                onClick={() => setView("library")}
-              >
-                <span className="flex h-8 w-8 items-center justify-center rounded-lg border border-white/10 text-one">
-                  <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
-                    <path d="M3 11l9-7 9 7" />
-                    <path d="M5 10v9h14v-9" />
-                  </svg>
-                </span>
-                {sidebarExpanded && <span>Games</span>}
-              </button>
-            </nav>
-
-            {sidebarExpanded ? (
-              <div className="mt-6 px-3 text-[11px] uppercase tracking-[0.2em] text-muted">Last used</div>
-            ) : (
-              <div className="mx-4 mt-6 h-px bg-white/10" />
-            )}
-            <nav className="mt-2 flex flex-col gap-1 px-2">
-              <button
-                className={classNames(
-                  "flex w-full items-center gap-3 rounded-xl py-2 text-sm transition",
-                  view === "servers" || view === "wizard" || view === "detail"
-                    ? "bg-white/10 text-one"
-                    : "text-muted hover:bg-white/10",
-                  sidebarExpanded ? "px-3" : "justify-center px-2"
-                )}
-                onClick={() => setView("servers")}
-              >
-                <img src="/MC-logo.webp" alt="Minecraft" className="h-6 w-6 object-contain" />
-                {sidebarExpanded && <span>Minecraft</span>}
-              </button>
-            </nav>
-
-            {sidebarExpanded ? (
-              <div className="mt-6 px-3 text-[11px] uppercase tracking-[0.2em] text-muted">Servers</div>
-            ) : (
-              <div className="mx-4 mt-6 h-px bg-white/10" />
-            )}
-            <nav className="mt-2 flex flex-1 flex-col gap-1 overflow-y-auto px-2 pb-4">
-              {servers.length === 0 && sidebarExpanded && (
-                <span className="px-3 text-xs text-muted">No servers yet</span>
-              )}
-              {servers.map((server) => (
-                <button
-                  key={server.name}
-                  className={classNames(
-                    "flex w-full items-center gap-3 rounded-xl py-2 text-sm transition",
-                    selectedServer?.name === server.name && isServerView
-                      ? "bg-white/10 text-one"
-                      : "text-muted hover:bg-white/10",
-                    sidebarExpanded ? "px-3" : "justify-center px-2"
-                  )}
-                  onClick={() => handleOpenServer(server)}
-                >
-                  <span className="relative">
-                    <img
-                      src={serverIcons[server.name] ?? "/logo.png"}
-                      alt={server.name}
-                      className="h-8 w-8 rounded-lg object-cover"
-                    />
-                    {serverStatusFor(server) === "RUNNING" && (
-                      <span className="absolute -right-1 -top-1 h-2.5 w-2.5 rounded-full bg-secondary shadow-[0_0_0_2px_rgba(21,26,33,0.9)]" />
-                    )}
-                  </span>
-                  {sidebarExpanded && <span className="truncate">{server.name}</span>}
-                </button>
-              ))}
-            </nav>
-
-            <div className={classNames("px-2", sidebarExpanded ? "pb-3" : "pb-2")}
-            >
-              <button
-                className={classNames(
-                  "flex w-full items-center rounded-xl py-2 text-sm transition whitespace-nowrap",
-                  view === "settings" ? "bg-white/10 text-one" : "text-muted hover:bg-white/10",
-                  sidebarExpanded ? "px-3 gap-3" : "justify-center px-2 gap-0"
-                )}
-                onClick={() => setView("settings")}
-              >
-                <span className="flex h-8 w-8 items-center justify-center rounded-lg border border-white/10 text-one">
-                  <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
-                    <circle cx="12" cy="12" r="3" />
-                    <path d="M19.4 15a1.7 1.7 0 0 0 .33 1.82l.03.03a2 2 0 1 1-2.83 2.83l-.03-.03a1.7 1.7 0 0 0-1.82-.33 1.7 1.7 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.06a1.7 1.7 0 0 0-1-1.51 1.7 1.7 0 0 0-1.82.33l-.03.03a2 2 0 1 1-2.83-2.83l.03-.03a1.7 1.7 0 0 0 .33-1.82 1.7 1.7 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.06a1.7 1.7 0 0 0 1.51-1 1.7 1.7 0 0 0-.33-1.82l-.03-.03a2 2 0 1 1 2.83-2.83l.03.03a1.7 1.7 0 0 0 1.82.33 1.7 1.7 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.06a1.7 1.7 0 0 0 1 1.51 1.7 1.7 0 0 0 1.82-.33l.03-.03a2 2 0 1 1 2.83 2.83l-.03.03a1.7 1.7 0 0 0-.33 1.82 1.7 1.7 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.06a1.7 1.7 0 0 0-1.51 1z" />
-                  </svg>
-                </span>
-                {sidebarExpanded && <span>Settings</span>}
-              </button>
-            </div>
-
-            <div className="px-4 pb-5">
-              <button
-                className={classNames(
-                  "no-drag flex w-full items-center justify-center rounded-full border border-white/10 bg-white/5 py-2 text-one transition hover:bg-white/10",
-                  sidebarExpanded ? "" : "mx-auto"
-                )}
-                onClick={() => setSidebarExpanded((prev) => !prev)}
-                aria-label={sidebarExpanded ? "Collapse sidebar" : "Expand sidebar"}
-              >
-                <span
-                  className={classNames(
-                    "text-base transition-transform duration-300",
-                    sidebarExpanded ? "rotate-180" : "rotate-0"
-                  )}
-                >
-                  <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M5 12h14" />
-                    <path d="M13 6l6 6-6 6" />
-                  </svg>
-                </span>
-              </button>
-            </div>
-            </aside>
+            <Sidebar
+              view={view}
+              setView={setView}
+              sidebarExpanded={sidebarExpanded}
+              setSidebarExpanded={setSidebarExpanded}
+              servers={servers}
+              selectedServer={selectedServer}
+              isServerView={isServerView}
+              serverIcons={serverIcons}
+              serverStatusFor={serverStatusFor}
+              handleOpenServer={handleOpenServer}
+            />
           )}
           <div className="content-scroll flex-1 min-h-0 overflow-y-auto px-6 pb-12 pt-8 lg:px-12">
           {fatalError && (
@@ -2142,140 +1957,28 @@ function App() {
               </div>
             </div>
           )}
-          {deleteTarget && (
-            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4">
-              <div className="w-full max-w-md rounded-3xl border border-white/10 bg-surface p-6 shadow-soft">
-                <p className="text-xs uppercase tracking-[0.2em] text-danger">Delete server</p>
-                <h3 className="mt-2 font-display text-xl text-text">This action is irreversible</h3>
-                <p className="mt-2 text-sm text-muted">
-                  Type the server name to confirm deletion. All files will be removed.
-                </p>
-                <div className="mt-4 rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
-                  <p className="text-xs uppercase tracking-[0.2em] text-muted">Server name</p>
-                  <div className="mt-2 flex items-center justify-between gap-3">
-                    <span className="text-sm text-text">{deleteTarget.name}</span>
-                    <SubtleButton
-                      onClick={() => navigator.clipboard?.writeText(deleteTarget.name)}
-                      className="bg-white/10 text-muted hover:bg-white/20"
-                    >
-                      Copy
-                    </SubtleButton>
-                  </div>
-                </div>
-                <input
-                  className="mt-4 w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-text transition focus:border-danger/60 focus:outline-none"
-                  placeholder="Type server name"
-                  value={deleteConfirm}
-                  onChange={(event) => setDeleteConfirm(event.target.value)}
-                />
-                <div className="mt-5 flex items-center justify-end gap-3">
-                  <SubtleButton onClick={() => setDeleteTarget(null)}>Cancel</SubtleButton>
-                  <button
-                    className={classNames(
-                      "rounded-full bg-danger px-4 py-2 text-xs font-semibold text-white transition",
-                      deleteMatches ? "hover:bg-danger/90" : "opacity-50"
-                    )}
-                    onClick={() => handleDeleteServer()}
-                    disabled={!deleteMatches || deleteBusy}
-                  >
-                    {deleteBusy ? "Deleting..." : "Delete server"}
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
-          {importOpen && (
-            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4">
-              <div className="w-full max-w-2xl rounded-3xl border border-white/10 bg-surface p-6 shadow-soft">
-                <p className="text-xs uppercase tracking-[0.2em] text-muted">Import server</p>
-                <h3 className="mt-2 font-display text-xl text-text">Import existing Minecraft server</h3>
-                <p className="mt-2 text-sm text-muted">
-                  Link an existing server folder or copy it into Gamehost ONE.
-                </p>
-
-                <div className="mt-4 grid gap-3">
-                  <button
-                    className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-left text-sm text-text transition hover:border-one/40 hover:bg-white/10"
-                    onClick={handleImportPick}
-                  >
-                    {importPath ? importPath : "Select server folder"}
-                  </button>
-
-                  {importAnalysis && (
-                    <div className="rounded-2xl border border-white/10 bg-white/5 p-4 text-sm text-muted">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <span className="text-text">Detected {getServerTypeLabel(importAnalysis.server_type)} server</span>
-                        <span>Version {importAnalysis.detected_version}</span>
-                      </div>
-                      <div className="mt-2 grid gap-1 text-xs">
-                        <span>{importAnalysis.has_properties ? "server.properties found" : "server.properties missing"}</span>
-                        <span>{importAnalysis.has_world ? "world folder found" : "world folder missing"}</span>
-                        {importAnalysis.detected_ram_gb ? (
-                          <span>Detected RAM: {importAnalysis.detected_ram_gb} GB</span>
-                        ) : (
-                          <span>No RAM config detected</span>
-                        )}
-                      </div>
-                      {importAnalysis.warnings.length > 0 && (
-                        <div className="mt-3 grid gap-2 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
-                          {importAnalysis.warnings.map((warning) => (
-                            <span key={warning}>{warning}</span>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  )}
-
-                  <div className="grid gap-2">
-                    <label className="text-xs uppercase tracking-[0.2em] text-muted">Server name</label>
-                    <input
-                      className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-text transition focus:border-one/60 focus:outline-none"
-                      value={importName}
-                      onChange={(event) => setImportName(event.target.value)}
-                      placeholder="Imported server"
-                    />
-                  </div>
-
-                  <div className="grid gap-2">
-                    <label className="text-xs uppercase tracking-[0.2em] text-muted">Import mode</label>
-                    <div className="flex flex-wrap gap-2">
-                      <button
-                        type="button"
-                        className={classNames(
-                          "rounded-full px-4 py-2 text-xs font-semibold transition",
-                          importMode === "copy"
-                            ? "bg-one text-white"
-                            : "bg-white/10 text-text hover:bg-white/20"
-                        )}
-                        onClick={() => setImportMode("copy")}
-                      >
-                        Copy into Gamehost (recommended)
-                      </button>
-                      <button
-                        type="button"
-                        className={classNames(
-                          "rounded-full px-4 py-2 text-xs font-semibold transition",
-                          importMode === "link"
-                            ? "bg-one text-white"
-                            : "bg-white/10 text-text hover:bg-white/20"
-                        )}
-                        onClick={() => setImportMode("link")}
-                      >
-                        Link folder
-                      </button>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="mt-5 flex items-center justify-end gap-3">
-                  <SubtleButton onClick={() => setImportOpen(false)}>Cancel</SubtleButton>
-                  <PrimaryButton onClick={handleImportServer} disabled={!importPath || !importName.trim() || importBusy}>
-                    {importBusy ? "Importing..." : "Finish import"}
-                  </PrimaryButton>
-                </div>
-              </div>
-            </div>
-          )}
+          <DeleteServerModal
+            target={deleteTarget}
+            confirmText={deleteConfirm}
+            deleteMatches={deleteMatches}
+            deleteBusy={deleteBusy}
+            onConfirmTextChange={setDeleteConfirm}
+            onCancel={() => setDeleteTarget(null)}
+            onDelete={() => handleDeleteServer()}
+          />
+          <ImportServerModal
+            open={importOpen}
+            importPath={importPath}
+            importAnalysis={importAnalysis}
+            importName={importName}
+            importMode={importMode}
+            importBusy={importBusy}
+            onClose={() => setImportOpen(false)}
+            onPick={handleImportPick}
+            onNameChange={setImportName}
+            onModeChange={setImportMode}
+            onImport={handleImportServer}
+          />
           {modMetaOpen && (
             <div className="fixed inset-0 z-60 flex items-center justify-center bg-black/60 px-4">
               <div className="w-full max-w-md rounded-3xl border border-white/10 bg-surface p-6 text-sm text-text shadow-soft">
@@ -2351,91 +2054,24 @@ function App() {
               </div>
             </div>
           )}
-          {javaModalOpen && javaStatus && (
-            <div className="fixed inset-0 z-60 flex items-center justify-center bg-black/60 px-6">
-              <div className="w-full max-w-md rounded-3xl border border-white/10 bg-surface p-6 text-sm text-text shadow-soft">
-                <div className="flex items-start justify-between gap-4">
-                  <div>
-                    <p className="text-xs uppercase tracking-[0.2em] text-muted">Java required</p>
-                    <h3 className="mt-2 font-display text-xl text-text">Java is required to run this Minecraft server.</h3>
-                  </div>
-                  <button
-                    className="rounded-full border border-white/10 px-3 py-1 text-xs text-muted transition hover:bg-white/10 hover:text-text"
-                    onClick={() => {
-                      setJavaModalOpen(false);
-                      setPendingJavaAction(null);
-                      setJavaDownloadProgress(null);
-                    }}
-                  >
-                    Close
-                  </button>
-                </div>
-                <div className="mt-4 grid gap-2 text-sm text-muted">
-                  <p>GameHost ONE can download a secure runtime for you.</p>
-                  <p>This Java version will be used only by GameHost ONE.</p>
-                </div>
-                <div className="mt-4 grid gap-2 rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
-                  <p className="text-sm font-semibold text-text">Required: Java {javaStatus.required_major}</p>
-                  {javaStatus.status === "missing" && (
-                    <p className="text-xs text-muted">Not detected on your system</p>
-                  )}
-                  {javaStatus.status === "unsupported" && (
-                    <p className="text-xs text-muted">
-                      Detected: Java {javaStatus.selected_major ?? "unknown"}
-                    </p>
-                  )}
-                </div>
-                {javaDownloadProgress !== null && (
-                  <div className="mt-4 grid gap-2">
-                    <div className="flex items-center justify-between text-xs text-muted">
-                      <span>Downloading Java...</span>
-                      <span>{Math.round(javaDownloadProgress)}%</span>
-                    </div>
-                    <div className="h-2 w-full overflow-hidden rounded-full bg-white/10">
-                      <div
-                        className="h-full rounded-full bg-secondary transition-all"
-                        style={{ width: `${Math.min(100, Math.max(0, javaDownloadProgress))}%` }}
-                      />
-                    </div>
-                  </div>
-                )}
-                <div className="mt-5 flex flex-col gap-3">
-                  <PrimaryButton onClick={handleDownloadJava} disabled={javaBusy}>
-                    {javaBusy ? "Downloading..." : "Download & Install Java (Recommended)"}
-                  </PrimaryButton>
-                  <SubtleButton onClick={handleSelectJava} disabled={javaBusy}>
-                    Select existing Java manually
-                  </SubtleButton>
-                </div>
-              </div>
-            </div>
-          )}
-          {launcherChoiceOpen && (
-            <div className="fixed inset-0 z-60 flex items-center justify-center bg-black/60 px-6">
-              <div className="w-full max-w-sm rounded-3xl border border-white/10 bg-surface p-6 text-sm text-text shadow-soft">
-                <div className="flex items-start justify-between gap-4">
-                  <div>
-                    <p className="text-xs uppercase tracking-[0.2em] text-muted">Launcher</p>
-                    <h3 className="mt-2 font-display text-xl text-text">Choose your Minecraft launcher</h3>
-                  </div>
-                  <button
-                    className="rounded-full border border-white/10 px-3 py-1 text-xs text-muted transition hover:bg-white/10 hover:text-text"
-                    onClick={() => setLauncherChoiceOpen(false)}
-                  >
-                    Close
-                  </button>
-                </div>
-                <div className="mt-5 grid gap-3">
-                  <PrimaryButton onClick={() => handleChooseLauncher("official")}>
-                    Official Minecraft Launcher
-                  </PrimaryButton>
-                  <SubtleButton onClick={() => handleChooseLauncher("tlauncher")}>
-                    TLauncher
-                  </SubtleButton>
-                </div>
-              </div>
-            </div>
-          )}
+          <JavaModal
+            open={javaModalOpen}
+            status={javaStatus}
+            downloadProgress={javaDownloadProgress}
+            busy={javaBusy}
+            onClose={() => {
+              setJavaModalOpen(false);
+              setPendingJavaAction(null);
+              setJavaDownloadProgress(null);
+            }}
+            onDownload={handleDownloadJava}
+            onSelect={handleSelectJava}
+          />
+          <LauncherModal
+            open={launcherChoiceOpen}
+            onClose={() => setLauncherChoiceOpen(false)}
+            onChoose={handleChooseLauncher}
+          />
           {joinHelpOpen && (
             <div className="fixed inset-0 z-60 flex items-center justify-center bg-black/60 px-6">
               <div className="w-full max-w-sm rounded-3xl border border-white/10 bg-surface p-6 text-sm text-text shadow-soft">
@@ -2515,78 +2151,16 @@ function App() {
               </div>
             </div>
           )}
-          {crashModalOpen && (
-            <div className="fixed inset-0 z-60 flex items-center justify-center bg-black/60 px-6">
-              <div className="w-full max-w-4xl rounded-3xl border border-white/10 bg-surface p-6 text-sm text-text shadow-soft">
-                <div className="flex items-start justify-between gap-4">
-                  <div>
-                    <p className="text-xs uppercase tracking-[0.2em] text-muted">Crash reports</p>
-                    <h3 className="mt-2 font-display text-xl text-text">Previous crash detected</h3>
-                  </div>
-                  <button
-                    className="rounded-full border border-white/10 px-3 py-1 text-xs text-muted transition hover:bg-white/10 hover:text-text"
-                    onClick={() => setCrashModalOpen(false)}
-                  >
-                    Close
-                  </button>
-                </div>
-                <div className="mt-5 grid gap-4 lg:grid-cols-[1fr_1.4fr]">
-                  <div className="grid gap-3">
-                    {crashReports.length === 0 ? (
-                      <p className="text-xs text-muted">No crash reports found.</p>
-                    ) : (
-                      crashReports.map((report) => (
-                        <button
-                          key={report.file_name}
-                          className="flex flex-col gap-2 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-left transition hover:border-one/40"
-                          onClick={() => openCrashReport(report.file_name)}
-                        >
-                          <span className="text-sm text-text">{new Date(report.timestamp).toLocaleString()}</span>
-                          <span className="text-xs text-muted">{report.message}</span>
-                        </button>
-                      ))
-                    )}
-                    {crashReports.length > 0 && (
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-2">
-                          <SubtleButton onClick={handleExportCrashReports}>Export reports</SubtleButton>
-                          <SubtleButton onClick={clearCrashReports} className="text-danger">
-                            Clear all
-                          </SubtleButton>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                  <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-4">
-                    {crashLoading ? (
-                      <p className="text-xs text-muted">Loading report...</p>
-                    ) : activeCrashReport ? (
-                      <div className="grid gap-3">
-                        <div>
-                          <p className="text-xs uppercase tracking-[0.2em] text-muted">Message</p>
-                          <p className="mt-2 text-sm text-text">{activeCrashReport.message}</p>
-                        </div>
-                        <div>
-                          <p className="text-xs uppercase tracking-[0.2em] text-muted">Environment</p>
-                          <p className="mt-2 text-xs text-muted">
-                            {activeCrashReport.os} · v{activeCrashReport.app_version}
-                          </p>
-                        </div>
-                        <div>
-                          <p className="text-xs uppercase tracking-[0.2em] text-muted">Backtrace</p>
-                          <pre className="mt-2 max-h-52 overflow-y-auto rounded-2xl bg-black/40 p-3 text-[11px] text-muted">
-                            {activeCrashReport.backtrace}
-                          </pre>
-                        </div>
-                      </div>
-                    ) : (
-                      <p className="text-xs text-muted">Select a report to view details.</p>
-                    )}
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
+          <CrashModal
+            open={crashModalOpen}
+            crashReports={crashReports}
+            crashLoading={crashLoading}
+            activeCrashReport={activeCrashReport}
+            onClose={() => setCrashModalOpen(false)}
+            onOpenReport={openCrashReport}
+            onClear={clearCrashReports}
+            onExport={handleExportCrashReports}
+          />
           <AnimatePresence>
             {tutorialActive && activeTutorialStep && (
               <motion.div
