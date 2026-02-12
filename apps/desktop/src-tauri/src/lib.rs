@@ -3,6 +3,8 @@ use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -497,6 +499,11 @@ impl ProcessManager {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(target_os = "windows")]
+        {
+            // Prevent a separate console window from appearing for the Java server process.
+            command.creation_flags(0x08000000);
+        }
 
         match &config.launcher {
             LauncherConfig::Jar { jar_path } => {
@@ -2208,6 +2215,25 @@ fn download_update(download_url: String, app: AppHandle) -> Result<String, Strin
     let mut file = File::create(&destination).map_err(|err| err.to_string())?;
     response.copy_to(&mut file).map_err(|err| err.to_string())?;
     Ok(destination.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn install_update(download_url: String, app: AppHandle) -> Result<(), String> {
+    let path = download_update(download_url, app.clone())?;
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("msiexec")
+            .arg("/i")
+            .arg(&path)
+            .spawn()
+            .map_err(|err| err.to_string())?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        return Err("Update installer is only supported on Windows.".to_string());
+    }
+    app.exit(0);
+    Ok(())
 }
 
 #[tauri::command]
@@ -5384,6 +5410,7 @@ pub fn run() {
             export_crash_reports,
             check_for_updates,
             download_update,
+            install_update,
             get_forge_versions,
         ])
         .run(tauri::generate_context!())
