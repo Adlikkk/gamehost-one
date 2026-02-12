@@ -74,6 +74,15 @@ export function ServerSettingsFields({
               <Switch.Thumb className="block h-5 w-5 translate-x-0.5 rounded-full bg-white transition data-[state=checked]:translate-x-5" />
             </Switch.Root>
           </SettingRow>
+          <SettingRow label="Allow flight" description="Allow flying for jetpacks and creative-style mods.">
+            <Switch.Root
+              checked={settings.allowFlight}
+              onCheckedChange={(value) => update({ allowFlight: value })}
+              className="relative h-6 w-11 rounded-full bg-white/15 transition data-[state=checked]:bg-one"
+            >
+              <Switch.Thumb className="block h-5 w-5 translate-x-0.5 rounded-full bg-white transition data-[state=checked]:translate-x-5" />
+            </Switch.Root>
+          </SettingRow>
           <SettingRow label="Max players" description="How many players can join at once.">
             <input
               type="number"

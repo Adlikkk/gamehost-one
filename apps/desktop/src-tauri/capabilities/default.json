@@ -34,6 +34,8 @@
     },
     "dialog:allow-open",
     "dialog:allow-save",
+    "dialog:allow-confirm",
+    "dialog:default",
     {
       "identifier": "fs:scope",
       "allow": [

@@ -203,6 +203,20 @@ struct AppSettings {
     crash_reporting_enabled: bool,
     analytics_endpoint: Option<String>,
     launcher_path: Option<String>,
+    #[serde(default)]
+    smart_join_panel_enabled: bool,
+    #[serde(default = "default_notify_on_server_start")]
+    notify_on_server_start: bool,
+    #[serde(default = "default_mod_sync_mode")]
+    mod_sync_mode: String,
+}
+
+fn default_mod_sync_mode() -> String {
+    "ask".to_string()
+}
+
+fn default_notify_on_server_start() -> bool {
+    true
 }
 
 impl Default for AppSettings {
@@ -212,6 +226,9 @@ impl Default for AppSettings {
             crash_reporting_enabled: false,
             analytics_endpoint: None,
             launcher_path: None,
+            smart_join_panel_enabled: true,
+            notify_on_server_start: default_notify_on_server_start(),
+            mod_sync_mode: default_mod_sync_mode(),
         }
     }
 }
@@ -404,6 +421,9 @@ struct ServerSettings {
     gamemode: String,
     #[serde(rename = "pvp")]
     pvp: bool,
+    #[serde(rename = "allow_flight", alias = "allowFlight")]
+    #[serde(default)]
+    allow_flight: bool,
     #[serde(rename = "max_players", alias = "maxPlayers")]
     max_players: u16,
     #[serde(rename = "view_distance", alias = "viewDistance")]
@@ -417,6 +437,7 @@ impl Default for ServerSettings {
             difficulty: "normal".to_string(),
             gamemode: "survival".to_string(),
             pvp: true,
+            allow_flight: false,
             max_players: 20,
             view_distance: 10,
         }
@@ -630,6 +651,7 @@ fn create_server(config: ServerConfigInput, state: State<AppState>, app: AppHand
     let launcher = install_server(&config, &server_dir, java_exe.as_deref())?;
     write_server_properties(&server_dir, config.port, config.online_mode)?;
     write_eula(&server_dir)?;
+    let _ = ensure_server_icon(&server_dir);
 
     if let Some(world_import) = &config.world_import {
         import_world_into_server(&server_dir, &server_name, world_import, &state, &app)?;
@@ -664,6 +686,10 @@ fn create_server(config: ServerConfigInput, state: State<AppState>, app: AppHand
 #[tauri::command]
 fn list_servers(state: State<AppState>) -> Result<Vec<ServerConfig>, String> {
     let registry = load_registry(&state.registry_path, &state.legacy_config_path)?;
+    for server in registry.servers.iter() {
+        let server_dir = PathBuf::from(&server.server_dir);
+        let _ = ensure_server_icon(&server_dir);
+    }
     Ok(registry.servers)
 }
 
@@ -1033,6 +1059,7 @@ fn reinstall_server(
     let launcher = install_server(&reinstall_input, &server_dir, java_exe.as_deref())?;
     write_server_properties(&server_dir, port, online_mode)?;
     write_eula(&server_dir)?;
+    let _ = ensure_server_icon(&server_dir);
 
     if preserve_world {
         fs::rename(&temp_world, server_dir.join("world")).map_err(|err| err.to_string())?;
@@ -1118,6 +1145,8 @@ fn import_server(request: ImportRequest, state: State<AppState>, app: AppHandle)
         linked: request.mode == "link",
     };
 
+    let _ = ensure_server_icon(&target_dir);
+
     registry.servers.push(final_config.clone());
     save_registry(&state.registry_path, &registry)?;
     if let Ok(metadata) = scan_server_metadata(&target_dir) {
@@ -1155,177 +1184,296 @@ fn update_server_meta(server_id: String, meta: ServerMeta, state: State<AppState
 }
 
 #[tauri::command]
-fn export_world(
+async fn export_world(
     server_id: String,
     destination: String,
     include_nether: bool,
     include_end: bool,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<(), String> {
-    let server_dir = resolve_server_dir(&state, &server_id)?;
-    let running = is_server_running(&state)?;
-    if running {
-        let mut manager = state
-            .process
-            .lock()
-            .map_err(|_| "Failed to lock process state")?;
-        if manager
-            .active_server_id
-            .as_deref()
-            .is_some_and(|active| active != server_id)
-        {
-            return Err("Another server is currently running".to_string());
+    let data_dir = state.data_dir.clone();
+    let registry_path = state.registry_path.clone();
+    let legacy_config_path = state.legacy_config_path.clone();
+    let process = state.process.clone();
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let local_state = AppState {
+            data_dir,
+            registry_path,
+            legacy_config_path,
+            process,
+        };
+        let server_dir = resolve_server_dir(&local_state, &server_id)?;
+        let running = is_server_running(&local_state)?;
+        if running {
+            let mut manager = local_state
+                .process
+                .lock()
+                .map_err(|_| "Failed to lock process state")?;
+            if manager
+                .active_server_id
+                .as_deref()
+                .is_some_and(|active| active != server_id)
+            {
+                return Err("Another server is currently running".to_string());
+            }
+            manager.stop(&app)?;
         }
-        manager.stop(&app)?;
-    }
 
-    let destination = PathBuf::from(destination);
-    zip_world_to_path(&server_dir, &destination, include_nether, include_end, Some(&app), "export:progress", &server_id)?;
-    append_log(&state.data_dir, &format!("Exported world for server: {}", server_id));
-    Ok(())
+        let destination = PathBuf::from(destination);
+        zip_world_to_path(
+            &server_dir,
+            &destination,
+            include_nether,
+            include_end,
+            Some(&app),
+            "export:progress",
+            &server_id,
+        )?;
+        append_log(&local_state.data_dir, &format!("Exported world for server: {}", server_id));
+        Ok(())
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
-fn create_backup(
+async fn create_backup(
     server_id: String,
     include_nether: bool,
     include_end: bool,
     reason: Option<String>,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<BackupEntry, String> {
-    let reason_label = reason.unwrap_or_else(|| "manual".to_string());
-    perform_backup(&app, &state, &server_id, include_nether, include_end, &reason_label)
+    let data_dir = state.data_dir.clone();
+    let registry_path = state.registry_path.clone();
+    let legacy_config_path = state.legacy_config_path.clone();
+    let process = state.process.clone();
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let local_state = AppState {
+            data_dir,
+            registry_path,
+            legacy_config_path,
+            process,
+        };
+        let reason_label = reason.unwrap_or_else(|| "manual".to_string());
+        perform_backup(&app, &local_state, &server_id, include_nether, include_end, &reason_label)
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
-fn list_backups(server_id: String, state: State<AppState>) -> Result<Vec<BackupEntry>, String> {
-    load_backup_manifest(&state.data_dir, &server_id)
+async fn list_backups(server_id: String, state: State<'_, AppState>) -> Result<Vec<BackupEntry>, String> {
+    let data_dir = state.data_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || load_backup_manifest(&data_dir, &server_id))
+        .await
+        .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
-fn delete_backup(server_id: String, backup_id: String, state: State<AppState>) -> Result<(), String> {
-    let mut manifest = load_backup_manifest(&state.data_dir, &server_id)?;
-    if let Some(entry) = manifest.iter().find(|entry| entry.id == backup_id) {
-        let _ = fs::remove_file(&entry.path);
-    }
-    manifest.retain(|entry| entry.id != backup_id);
-    save_backup_manifest(&state.data_dir, &server_id, &manifest)?;
-    append_log(&state.data_dir, &format!("Backup deleted: {}", backup_id));
-    Ok(())
-}
-
-#[tauri::command]
-fn restore_backup(server_id: String, backup_id: String, state: State<AppState>, app: AppHandle) -> Result<(), String> {
-    let server_dir = resolve_server_dir(&state, &server_id)?;
-    let running = is_server_running(&state)?;
-    if running {
-        let mut manager = state
-            .process
-            .lock()
-            .map_err(|_| "Failed to lock process state")?;
-        if manager
-            .active_server_id
-            .as_deref()
-            .is_some_and(|active| active != server_id)
-        {
-            return Err("Another server is currently running".to_string());
+async fn delete_backup(server_id: String, backup_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let data_dir = state.data_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut manifest = load_backup_manifest(&data_dir, &server_id)?;
+        if let Some(entry) = manifest.iter().find(|entry| entry.id == backup_id) {
+            let _ = fs::remove_file(&entry.path);
         }
-        manager.stop(&app)?;
-    }
-
-    let manifest = load_backup_manifest(&state.data_dir, &server_id)?;
-    let entry = manifest
-        .iter()
-        .find(|entry| entry.id == backup_id)
-        .ok_or("Backup not found")?;
-
-    let zip_file = File::open(&entry.path).map_err(|err| err.to_string())?;
-    let mut archive = zip::ZipArchive::new(zip_file).map_err(|err| err.to_string())?;
-
-    for folder in ["world", "world_nether", "world_the_end"] {
-        let path = server_dir.join(folder);
-        if path.exists() {
-            fs::remove_dir_all(&path).map_err(|err| err.to_string())?;
-        }
-    }
-
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i).map_err(|err| err.to_string())?;
-        let outpath = server_dir.join(file.name());
-        if file.name().ends_with('/') {
-            fs::create_dir_all(&outpath).map_err(|err| err.to_string())?;
-        } else {
-            if let Some(parent) = outpath.parent() {
-                fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        manifest.retain(|entry| entry.id != backup_id);
+        save_backup_manifest(&data_dir, &server_id, &manifest)?;
+        append_log(&data_dir, &format!("Backup deleted: {}", backup_id));
+        Ok(())
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+#[tauri::command]
+async fn restore_backup(
+    server_id: String,
+    backup_id: String,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let data_dir = state.data_dir.clone();
+    let registry_path = state.registry_path.clone();
+    let legacy_config_path = state.legacy_config_path.clone();
+    let process = state.process.clone();
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let local_state = AppState {
+            data_dir,
+            registry_path,
+            legacy_config_path,
+            process,
+        };
+        let server_dir = resolve_server_dir(&local_state, &server_id)?;
+        let running = is_server_running(&local_state)?;
+        if running {
+            let mut manager = local_state
+                .process
+                .lock()
+                .map_err(|_| "Failed to lock process state")?;
+            if manager
+                .active_server_id
+                .as_deref()
+                .is_some_and(|active| active != server_id)
+            {
+                return Err("Another server is currently running".to_string());
             }
-            let mut outfile = File::create(&outpath).map_err(|err| err.to_string())?;
-            std::io::copy(&mut file, &mut outfile).map_err(|err| err.to_string())?;
+            manager.stop(&app)?;
         }
-    }
 
-    append_log(&state.data_dir, &format!("Backup restored: {}", backup_id));
-    Ok(())
+        let manifest = load_backup_manifest(&local_state.data_dir, &server_id)?;
+        let entry = manifest
+            .iter()
+            .find(|item| item.id == backup_id)
+            .ok_or("Backup not found")?;
+
+        let zip_file = File::open(&entry.path).map_err(|err| err.to_string())?;
+        let mut archive = zip::ZipArchive::new(zip_file).map_err(|err| err.to_string())?;
+
+        for folder in ["world", "world_nether", "world_the_end"] {
+            let path = server_dir.join(folder);
+            if path.exists() {
+                fs::remove_dir_all(&path).map_err(|err| err.to_string())?;
+            }
+        }
+
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i).map_err(|err| err.to_string())?;
+            let outpath = server_dir.join(file.name());
+            if file.name().ends_with('/') {
+                fs::create_dir_all(&outpath).map_err(|err| err.to_string())?;
+            } else {
+                if let Some(parent) = outpath.parent() {
+                    fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+                }
+                let mut outfile = File::create(&outpath).map_err(|err| err.to_string())?;
+                std::io::copy(&mut file, &mut outfile).map_err(|err| err.to_string())?;
+            }
+        }
+
+        append_log(&local_state.data_dir, &format!("Backup restored: {}", backup_id));
+        Ok(())
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
-fn list_mods(server_id: String, state: State<AppState>) -> Result<Vec<ModEntry>, String> {
-    let server_dir = resolve_server_dir(&state, &server_id)?;
-    let mods_dir = server_dir.join("mods");
-    if !mods_dir.exists() {
-        return Ok(Vec::new());
-    }
+async fn list_mods(server_id: String, state: State<'_, AppState>) -> Result<Vec<ModEntry>, String> {
+    let registry_path = state.registry_path.clone();
+    let legacy_config_path = state.legacy_config_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let registry = load_registry(&registry_path, &legacy_config_path)?;
+        let config = get_server_by_id(&registry, &server_id).ok_or("Server not found")?;
+        let server_dir = PathBuf::from(&config.server_dir);
+        let mods_dir = server_dir.join("mods");
+        if !mods_dir.exists() {
+            return Ok(Vec::new());
+        }
 
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(&mods_dir).map_err(|err| err.to_string())? {
-        let entry = entry.map_err(|err| err.to_string())?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(&mods_dir).map_err(|err| err.to_string())? {
+            let entry = entry.map_err(|err| err.to_string())?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if !file_name.ends_with(".jar") && !file_name.ends_with(".jar.disabled") {
+                continue;
+            }
+            let enabled = file_name.ends_with(".jar");
+            let name = file_name
+                .trim_end_matches(".disabled")
+                .trim_end_matches(".jar")
+                .to_string();
+            entries.push(ModEntry {
+                name,
+                enabled,
+                file_name,
+            });
         }
-        let file_name = entry.file_name().to_string_lossy().to_string();
-        if !file_name.ends_with(".jar") && !file_name.ends_with(".jar.disabled") {
-            continue;
+
+        entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        Ok(entries)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+#[tauri::command]
+async fn add_mod(
+    server_id: String,
+    source_path: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let registry_path = state.registry_path.clone();
+    let legacy_config_path = state.legacy_config_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let registry = load_registry(&registry_path, &legacy_config_path)?;
+        let config = get_server_by_id(&registry, &server_id).ok_or("Server not found")?;
+        let server_dir = PathBuf::from(&config.server_dir);
+        let mods_dir = server_dir.join("mods");
+        fs::create_dir_all(&mods_dir).map_err(|err| err.to_string())?;
+
+        let source = PathBuf::from(&source_path);
+        if !source.exists() {
+            return Err("Mod file not found".to_string());
         }
-        let enabled = file_name.ends_with(".jar");
-        let name = file_name
-            .trim_end_matches(".disabled")
-            .trim_end_matches(".jar")
+        if source.extension().and_then(|s| s.to_str()) != Some("jar") {
+            return Err("Only .jar mods are supported".to_string());
+        }
+
+        let file_name = source
+            .file_name()
+            .ok_or("Invalid mod file name")?
+            .to_string_lossy()
             .to_string();
-        entries.push(ModEntry {
-            name,
-            enabled,
-            file_name,
-        });
-    }
-
-    entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    Ok(entries)
+        let destination = mods_dir.join(file_name);
+        fs::copy(&source, &destination).map_err(|err| err.to_string())?;
+        Ok(())
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
-fn add_mod(server_id: String, source_path: String, state: State<AppState>) -> Result<(), String> {
-    let server_dir = resolve_server_dir(&state, &server_id)?;
-    let mods_dir = server_dir.join("mods");
-    fs::create_dir_all(&mods_dir).map_err(|err| err.to_string())?;
+async fn delete_all_mods(server_id: String, state: State<'_, AppState>) -> Result<u32, String> {
+    let registry_path = state.registry_path.clone();
+    let legacy_config_path = state.legacy_config_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let registry = load_registry(&registry_path, &legacy_config_path)?;
+        let config = get_server_by_id(&registry, &server_id).ok_or("Server not found")?;
+        let server_dir = PathBuf::from(&config.server_dir);
+        let mods_dir = server_dir.join("mods");
+        if !mods_dir.exists() {
+            return Ok(0);
+        }
 
-    let source = PathBuf::from(&source_path);
-    if !source.exists() {
-        return Err("Mod file not found".to_string());
-    }
-    if source.extension().and_then(|s| s.to_str()) != Some("jar") {
-        return Err("Only .jar mods are supported".to_string());
-    }
+        let mut deleted = 0u32;
+        for entry in fs::read_dir(&mods_dir).map_err(|err| err.to_string())? {
+            let entry = entry.map_err(|err| err.to_string())?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if !file_name.ends_with(".jar") && !file_name.ends_with(".jar.disabled") {
+                continue;
+            }
+            fs::remove_file(&path).map_err(|err| err.to_string())?;
+            deleted += 1;
+        }
 
-    let file_name = source
-        .file_name()
-        .ok_or("Invalid mod file name")?
-        .to_string_lossy()
-        .to_string();
-    let destination = mods_dir.join(file_name);
-    fs::copy(&source, &destination).map_err(|err| err.to_string())?;
-    Ok(())
+        Ok(deleted)
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
@@ -1405,59 +1553,65 @@ fn toggle_mod(server_id: String, file_name: String, enabled: bool, state: State<
 }
 
 #[tauri::command]
-fn add_mod_with_meta(
+async fn add_mod_with_meta(
     server_id: String,
     source_path: String,
     mod_id: String,
     mod_version: String,
     url: String,
-    state: State<AppState>,
+    state: State<'_, AppState>,
 ) -> Result<ModpackManifest, String> {
-    let registry = load_registry(&state.registry_path, &state.legacy_config_path)?;
-    let config = registry
-        .servers
-        .iter()
-        .find(|server| server_matches_id(server, &server_id))
-        .ok_or("Server not found")?
-        .clone();
-    let server_dir = PathBuf::from(&config.server_dir);
-    let mods_dir = server_dir.join("mods");
-    fs::create_dir_all(&mods_dir).map_err(|err| err.to_string())?;
+    let registry_path = state.registry_path.clone();
+    let legacy_config_path = state.legacy_config_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let registry = load_registry(&registry_path, &legacy_config_path)?;
+        let config = registry
+            .servers
+            .iter()
+            .find(|server| server_matches_id(server, &server_id))
+            .ok_or("Server not found")?
+            .clone();
+        let server_dir = PathBuf::from(&config.server_dir);
+        let mods_dir = server_dir.join("mods");
+        fs::create_dir_all(&mods_dir).map_err(|err| err.to_string())?;
 
-    let source = PathBuf::from(&source_path);
-    if !source.exists() {
-        return Err("Mod file not found".to_string());
-    }
-    if source.extension().and_then(|s| s.to_str()) != Some("jar") {
-        return Err("Only .jar mods are supported".to_string());
-    }
-    if mod_id.trim().is_empty() || mod_version.trim().is_empty() {
-        return Err("Mod id and version are required".to_string());
-    }
+        let source = PathBuf::from(&source_path);
+        if !source.exists() {
+            return Err("Mod file not found".to_string());
+        }
+        if source.extension().and_then(|s| s.to_str()) != Some("jar") {
+            return Err("Only .jar mods are supported".to_string());
+        }
+        if mod_id.trim().is_empty() || mod_version.trim().is_empty() {
+            return Err("Mod id and version are required".to_string());
+        }
 
-    is_allowed_mod_url(&url)?;
+        is_allowed_mod_url(&url)?;
 
-    let file_name = source
-        .file_name()
-        .ok_or("Invalid mod file name")?
-        .to_string_lossy()
-        .to_string();
-    let destination = mods_dir.join(&file_name);
-    fs::copy(&source, &destination).map_err(|err| err.to_string())?;
+        let file_name = source
+            .file_name()
+            .ok_or("Invalid mod file name")?
+            .to_string_lossy()
+            .to_string();
+        let destination = mods_dir.join(&file_name);
+        fs::copy(&source, &destination).map_err(|err| err.to_string())?;
 
-    let sha256 = sha256_file(&destination)?;
-    let mut manifest = load_modpack(&server_dir, &config)?;
-    manifest
-        .mods
-        .retain(|entry| !entry.id.eq_ignore_ascii_case(mod_id.trim()));
-    manifest.mods.push(ModpackEntry {
-        id: mod_id.trim().to_string(),
-        version: mod_version.trim().to_string(),
-        sha256,
-        url: url.trim().to_string(),
-    });
-    save_modpack(&server_dir, &manifest)?;
-    Ok(manifest)
+        let sha256 = sha256_file(&destination)?;
+        let mut manifest = load_modpack(&server_dir, &config)?;
+        manifest
+            .mods
+            .retain(|entry| !entry.id.eq_ignore_ascii_case(mod_id.trim()));
+        manifest.mods.push(ModpackEntry {
+            id: mod_id.trim().to_string(),
+            version: mod_version.trim().to_string(),
+            sha256,
+            url: url.trim().to_string(),
+        });
+        save_modpack(&server_dir, &manifest)?;
+        Ok(manifest)
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
@@ -1473,113 +1627,125 @@ fn get_modpack(server_id: String, state: State<AppState>) -> Result<ModpackManif
 }
 
 #[tauri::command]
-fn check_mod_sync(server_id: String, state: State<AppState>) -> Result<ModSyncStatus, String> {
-    let registry = load_registry(&state.registry_path, &state.legacy_config_path)?;
-    let config = get_server_by_id(&registry, &server_id).ok_or("Server not found")?;
-    let server_dir = PathBuf::from(&config.server_dir);
-    let manifest = load_modpack(&server_dir, &config)?;
+async fn check_mod_sync(server_id: String, state: State<'_, AppState>) -> Result<ModSyncStatus, String> {
+    let registry_path = state.registry_path.clone();
+    let legacy_config_path = state.legacy_config_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let registry = load_registry(&registry_path, &legacy_config_path)?;
+        let config = get_server_by_id(&registry, &server_id).ok_or("Server not found")?;
+        let server_dir = PathBuf::from(&config.server_dir);
+        let manifest = load_modpack(&server_dir, &config)?;
 
-    let mods_dir = client_mods_dir().unwrap_or_else(|_| PathBuf::from(""));
-    let mut client_hashes = Vec::new();
-    let mut client_files = Vec::new();
-    let mut has_client_mods = false;
-    if mods_dir.exists() {
-        for entry in fs::read_dir(&mods_dir).map_err(|err| err.to_string())? {
-            let entry = entry.map_err(|err| err.to_string())?;
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let file_name = entry.file_name().to_string_lossy().to_string();
-            if !file_name.ends_with(".jar") {
-                continue;
-            }
-            has_client_mods = true;
-            if let Ok(hash) = sha256_file(&path) {
-                client_hashes.push(hash);
-                client_files.push(file_name.to_lowercase());
+        let mods_dir = client_mods_dir().unwrap_or_else(|_| PathBuf::from(""));
+        let mut client_hashes = Vec::new();
+        let mut client_files = Vec::new();
+        let mut has_client_mods = false;
+        if mods_dir.exists() {
+            for entry in fs::read_dir(&mods_dir).map_err(|err| err.to_string())? {
+                let entry = entry.map_err(|err| err.to_string())?;
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                if !file_name.ends_with(".jar") {
+                    continue;
+                }
+                has_client_mods = true;
+                if let Ok(hash) = sha256_file(&path) {
+                    client_hashes.push(hash);
+                    client_files.push(file_name.to_lowercase());
+                }
             }
         }
-    }
 
-    let mut mods = Vec::new();
-    for entry in manifest.mods.iter() {
-        let mut status = if !has_client_mods || entry.url.trim().is_empty() {
-            "unknown".to_string()
-        } else {
-            "missing".to_string()
-        };
-        if client_hashes.iter().any(|hash| hash == &entry.sha256) {
-            status = "installed".to_string();
-        } else if client_files.iter().any(|name| name.contains(&entry.id.to_lowercase())) {
-            status = "conflict".to_string();
+        let mut mods = Vec::new();
+        for entry in manifest.mods.iter() {
+            let mut status = if !has_client_mods || entry.url.trim().is_empty() {
+                "unknown".to_string()
+            } else {
+                "missing".to_string()
+            };
+            if client_hashes.iter().any(|hash| hash == &entry.sha256) {
+                status = "installed".to_string();
+            } else if client_files.iter().any(|name| name.contains(&entry.id.to_lowercase())) {
+                status = "conflict".to_string();
+            }
+            mods.push(ModSyncEntry {
+                id: entry.id.clone(),
+                version: entry.version.clone(),
+                status,
+            });
         }
-        mods.push(ModSyncEntry {
-            id: entry.id.clone(),
-            version: entry.version.clone(),
-            status,
-        });
-    }
 
-    Ok(ModSyncStatus {
-        mc_version: manifest.mc_version,
-        loader: manifest.loader,
-        mods,
+        Ok(ModSyncStatus {
+            mc_version: manifest.mc_version,
+            loader: manifest.loader,
+            mods,
+        })
     })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
-fn download_mods(
+async fn download_mods(
     server_id: String,
     mod_ids: Vec<String>,
-    state: State<AppState>,
+    state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let registry = load_registry(&state.registry_path, &state.legacy_config_path)?;
-    let config = get_server_by_id(&registry, &server_id).ok_or("Server not found")?;
-    let server_dir = PathBuf::from(&config.server_dir);
-    let manifest = load_modpack(&server_dir, &config)?;
-    let mods_dir = client_mods_dir()?;
-    fs::create_dir_all(&mods_dir).map_err(|err| err.to_string())?;
+    let registry_path = state.registry_path.clone();
+    let legacy_config_path = state.legacy_config_path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let registry = load_registry(&registry_path, &legacy_config_path)?;
+        let config = get_server_by_id(&registry, &server_id).ok_or("Server not found")?;
+        let server_dir = PathBuf::from(&config.server_dir);
+        let manifest = load_modpack(&server_dir, &config)?;
+        let mods_dir = client_mods_dir()?;
+        fs::create_dir_all(&mods_dir).map_err(|err| err.to_string())?;
 
-    let target_ids: Vec<String> = mod_ids.into_iter().map(|id| id.to_lowercase()).collect();
-    let client_hashes = if mods_dir.exists() {
-        fs::read_dir(&mods_dir)
-            .map_err(|err| err.to_string())?
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.path().is_file())
-            .filter_map(|entry| sha256_file(&entry.path()).ok())
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+        let target_ids: Vec<String> = mod_ids.into_iter().map(|id| id.to_lowercase()).collect();
+        let client_hashes = if mods_dir.exists() {
+            fs::read_dir(&mods_dir)
+                .map_err(|err| err.to_string())?
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.path().is_file())
+                .filter_map(|entry| sha256_file(&entry.path()).ok())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
 
-    let mut downloaded = 0usize;
-    for entry in manifest.mods.iter() {
-        if !target_ids.is_empty() && !target_ids.contains(&entry.id.to_lowercase()) {
-            continue;
+        let mut downloaded = 0usize;
+        for entry in manifest.mods.iter() {
+            if !target_ids.is_empty() && !target_ids.contains(&entry.id.to_lowercase()) {
+                continue;
+            }
+            if client_hashes.iter().any(|hash| hash == &entry.sha256) {
+                continue;
+            }
+            if entry.url.trim().is_empty() {
+                continue;
+            }
+            is_allowed_mod_url(&entry.url)?;
+            let file_name = filename_from_url(&entry.url)?;
+            let destination = mods_dir.join(&file_name);
+            if destination.exists() {
+                continue;
+            }
+            let client = reqwest::blocking::Client::new();
+            download_with_sha256(&client, &entry.url, &entry.sha256, &destination)?;
+            downloaded += 1;
         }
-        if client_hashes.iter().any(|hash| hash == &entry.sha256) {
-            continue;
-        }
-        if entry.url.trim().is_empty() {
-            continue;
-        }
-        is_allowed_mod_url(&entry.url)?;
-        let file_name = filename_from_url(&entry.url)?;
-        let destination = mods_dir.join(&file_name);
-        if destination.exists() {
-            continue;
-        }
-        let client = reqwest::blocking::Client::new();
-        download_with_sha256(&client, &entry.url, &entry.sha256, &destination)?;
-        downloaded += 1;
-    }
 
-    if !target_ids.is_empty() && downloaded == 0 {
-        return Err("Modpack entries do not include downloadable URLs.".to_string());
-    }
+        if !target_ids.is_empty() && downloaded == 0 {
+            return Err("Modpack entries do not include downloadable URLs.".to_string());
+        }
 
-    Ok(())
+        Ok(())
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 #[tauri::command]
@@ -2391,6 +2557,153 @@ fn client_version_installed(version: &str) -> bool {
         || version_dir.join(format!("{}.jar", version)).exists()
 }
 
+#[tauri::command]
+fn is_client_version_installed(version_id: String) -> Result<bool, String> {
+    Ok(client_version_installed(&version_id))
+}
+
+fn java_executable_for_client(mc_version: &str, base: &Path) -> Result<PathBuf, String> {
+    let required = required_java_major(mc_version);
+    let config = load_java_config(base);
+    let mut candidates = Vec::new();
+
+    if let Some(selected) = resolve_selected_java_path(base, &config) {
+        candidates.push(selected);
+    }
+
+    let runtime = runtime_java_exe(base);
+    if runtime.exists() {
+        candidates.push(runtime);
+    }
+
+    if let Some(system) = find_system_java_path() {
+        candidates.push(system);
+    }
+
+    for candidate in candidates {
+        if let Ok(major) = java_major_from_path(&candidate) {
+            if major >= required {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    Err(format!("Java {}+ is required to install this client.", required))
+}
+
+fn download_installer(url: &str, base: &Path, filename: &str) -> Result<PathBuf, String> {
+    ensure_https(url)?;
+    let client = reqwest::blocking::Client::new();
+    let response = client.get(url).send().map_err(|err| err.to_string())?;
+    if !response.status().is_success() {
+        return Err("Failed to download installer".to_string());
+    }
+    let bytes = response.bytes().map_err(|err| err.to_string())?;
+    let dir = base.join("temp").join("client-install");
+    fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    let path = dir.join(filename);
+    fs::write(&path, &bytes).map_err(|err| err.to_string())?;
+    Ok(path)
+}
+
+fn install_forge_client(mc_version: &str, forge_version: &str, base: &Path) -> Result<String, String> {
+    let version_id = format!("{}-forge-{}", mc_version, forge_version);
+    if client_version_installed(&version_id) {
+        return Ok(version_id);
+    }
+
+    let java_exe = java_executable_for_client(mc_version, base)?;
+    let url = format!(
+        "https://maven.minecraftforge.net/net/minecraftforge/forge/{mc}-{forge}/forge-{mc}-{forge}-installer.jar",
+        mc = mc_version,
+        forge = forge_version
+    );
+    let installer = download_installer(&url, base, &format!("forge-{mc}-{forge}-installer.jar", mc = mc_version, forge = forge_version))?;
+    let minecraft_dir = minecraft_dir()?;
+    let status = Command::new(java_exe)
+        .arg("-jar")
+        .arg(&installer)
+        .arg("--installClient")
+        .current_dir(&minecraft_dir)
+        .status()
+        .map_err(|err| err.to_string())?;
+    if !status.success() {
+        return Err("Forge installer failed".to_string());
+    }
+    if !client_version_installed(&version_id) {
+        return Err("Forge version was not installed correctly".to_string());
+    }
+    Ok(version_id)
+}
+
+fn install_fabric_client(mc_version: &str, loader_version: &str, base: &Path) -> Result<String, String> {
+    let version_id = format!("fabric-loader-{}-{}", loader_version, mc_version);
+    if client_version_installed(&version_id) {
+        return Ok(version_id);
+    }
+
+    let java_exe = java_executable_for_client(mc_version, base)?;
+    let installer_url = "https://meta.fabricmc.net/v2/versions/installer";
+    let client = reqwest::blocking::Client::new();
+    let response = client.get(installer_url).send().map_err(|err| err.to_string())?;
+    if !response.status().is_success() {
+        return Err("Unable to fetch Fabric installer metadata".to_string());
+    }
+    let list: serde_json::Value = response.json().map_err(|err| err.to_string())?;
+    let version = list
+        .as_array()
+        .and_then(|values| values.iter().find(|value| value.get("stable").and_then(|v| v.as_bool()).unwrap_or(false)))
+        .and_then(|value| value.get("version").and_then(|v| v.as_str()))
+        .ok_or("Unable to resolve Fabric installer version")?;
+
+    let installer_url = format!(
+        "https://maven.fabricmc.net/net/fabricmc/fabric-installer/{ver}/fabric-installer-{ver}.jar",
+        ver = version
+    );
+    let installer = download_installer(&installer_url, base, &format!("fabric-installer-{ver}.jar", ver = version))?;
+    let minecraft_dir = minecraft_dir()?;
+    let status = Command::new(java_exe)
+        .arg("-jar")
+        .arg(&installer)
+        .arg("client")
+        .arg("-mcversion")
+        .arg(mc_version)
+        .arg("-loader")
+        .arg(loader_version)
+        .arg("-noprofile")
+        .arg("-dir")
+        .arg(&minecraft_dir)
+        .current_dir(&minecraft_dir)
+        .status()
+        .map_err(|err| err.to_string())?;
+    if !status.success() {
+        return Err("Fabric installer failed".to_string());
+    }
+    if !client_version_installed(&version_id) {
+        return Err("Fabric version was not installed correctly".to_string());
+    }
+    Ok(version_id)
+}
+
+#[tauri::command]
+fn install_forge_client_cmd(mc_version: String, forge_version: String, app: AppHandle) -> Result<String, String> {
+    let base = app_data_dir(&app)?;
+    ensure_app_dirs(&base)?;
+    install_forge_client(&mc_version, &forge_version, &base)
+}
+
+#[tauri::command]
+fn install_fabric_client_cmd(mc_version: String, loader_version: String, app: AppHandle) -> Result<String, String> {
+    let base = app_data_dir(&app)?;
+    ensure_app_dirs(&base)?;
+    install_fabric_client(&mc_version, &loader_version, &base)
+}
+
+#[tauri::command]
+fn create_launcher_profile(version_id: String, server_name: Option<String>) -> Result<String, String> {
+    ensure_launcher_profile(&version_id, server_name.as_deref())
+}
+
 fn extract_mc_version(value: &str) -> Option<String> {
     let re = Regex::new(r"(\d+\.\d+(?:\.\d+)?)").ok()?;
     re.captures(value)
@@ -2503,6 +2816,16 @@ fn parse_latest_log() -> Option<(String, String)> {
 #[cfg(target_os = "windows")]
 const GAMEHOST_ICON_PNG: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../public/logo.png"));
 
+fn ensure_server_icon(server_dir: &Path) -> Result<(), String> {
+    let icon_path = server_dir.join("server-icon.png");
+    if icon_path.exists() {
+        return Ok(());
+    }
+    let mut file = File::create(&icon_path).map_err(|err| err.to_string())?;
+    file.write_all(GAMEHOST_ICON_PNG).map_err(|err| err.to_string())?;
+    Ok(())
+}
+
 fn ensure_launcher_profile(version: &str, server_name: Option<&str>) -> Result<String, String> {
     if !client_version_installed(version) {
         return Err("Client version is not installed".to_string());
@@ -2559,6 +2882,7 @@ fn ensure_launcher_profile(version: &str, server_name: Option<&str>) -> Result<S
 fn client_mods_dir() -> Result<PathBuf, String> {
     Ok(minecraft_dir()?.join("mods"))
 }
+
 
 fn sha256_file(path: &Path) -> Result<String, String> {
     let mut file = File::open(path).map_err(|err| err.to_string())?;
@@ -4077,6 +4401,9 @@ fn load_settings(server_dir: &Path) -> Result<ServerSettings, String> {
     if let Some(value) = props.get("pvp") {
         settings.pvp = value.eq_ignore_ascii_case("true");
     }
+    if let Some(value) = props.get("allow-flight") {
+        settings.allow_flight = value.eq_ignore_ascii_case("true");
+    }
     if let Some(value) = props.get("max-players") {
         if let Ok(parsed) = value.parse::<u16>() {
             settings.max_players = parsed;
@@ -4135,6 +4462,7 @@ fn apply_settings_to_properties(server_dir: &Path, settings: &ServerSettings) ->
         ("difficulty", settings.difficulty.to_lowercase()),
         ("gamemode", settings.gamemode.to_lowercase()),
         ("pvp", settings.pvp.to_string()),
+        ("allow-flight", settings.allow_flight.to_string()),
         ("max-players", settings.max_players.to_string()),
         ("view-distance", settings.view_distance.to_string()),
         ("playersSleepingPercentage", sleep_percentage.to_string()),
@@ -5035,12 +5363,17 @@ pub fn run() {
             list_mods,
             add_mod,
             add_mod_with_meta,
+            delete_all_mods,
             toggle_mod,
             get_modpack,
             check_mod_sync,
             download_mods,
             detect_minecraft_client,
+            is_client_version_installed,
             get_client_version_info,
+            install_forge_client_cmd,
+            install_fabric_client_cmd,
+            create_launcher_profile,
             launch_minecraft,
             get_app_settings,
             update_app_settings,
