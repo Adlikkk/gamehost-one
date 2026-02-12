@@ -171,6 +171,9 @@ export type AppSettings = {
   crash_reporting_enabled: boolean;
   analytics_endpoint?: string | null;
   launcher_path?: string | null;
+  smart_join_panel_enabled?: boolean;
+  notify_on_server_start?: boolean;
+  mod_sync_mode?: "ask" | "metadata" | "copy";
 };
 
 export type UpdateInfo = {
@@ -217,6 +220,7 @@ export type ServerSettings = {
   difficulty: Difficulty;
   gameMode: GameMode;
   pvp: boolean;
+  allowFlight: boolean;
   maxPlayers: number;
   viewDistance: number;
 };

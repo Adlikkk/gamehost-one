@@ -1,6 +1,7 @@
-import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { useDeferredValue, useEffect, useMemo, useRef, useState, useTransition } from "react";
 import type { DragEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import { appDataDir, dataDir, join } from "@tauri-apps/api/path";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -37,6 +38,9 @@ import { detectServerMetadata } from "./services/modDetection";
 import { detectClient } from "./services/clientDetector";
 import { compareClientToServer } from "./services/versionComparator";
 import { launchMinecraft as launchMinecraftClient } from "./services/minecraftLauncher";
+import { ensureClientLoaderInstalled } from "./services/loaderInstaller";
+import { createLauncherProfile } from "./services/launcherProfileManager";
+import { resolveRequiredClient } from "./services/versionResolver";
 import { useServerMetadata } from "./hooks/useServerMetadata";
 import type {
   AppSettings,
@@ -241,6 +245,7 @@ const DEFAULT_SETTINGS: ServerSettings = {
   difficulty: "Normal",
   gameMode: "Survival",
   pvp: true,
+  allowFlight: false,
   maxPlayers: 20,
   viewDistance: 10
 };
@@ -467,6 +472,7 @@ function App() {
   const [network, setNetwork] = useState<NetworkInfo | null>(null);
   const [commandInput, setCommandInput] = useState("");
   const [appDataPath, setAppDataPath] = useState<string | null>(null);
+  const [appVersion, setAppVersion] = useState<string | null>(null);
   const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
   const [appSettingsSaving, setAppSettingsSaving] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
@@ -479,6 +485,7 @@ function App() {
   const [activeCrashReport, setActiveCrashReport] = useState<CrashReport | null>(null);
   const [crashLoading, setCrashLoading] = useState(false);
   const [sidebarExpanded, setSidebarExpanded] = useState(true);
+  const [, startViewTransition] = useTransition();
   const [serverIcons, setServerIcons] = useState<Record<string, string>>({});
   const [motdDraft, setMotdDraft] = useState("");
   const [motdSaving, setMotdSaving] = useState(false);
@@ -501,7 +508,6 @@ function App() {
   const [wizardModsValidation, setWizardModsValidation] = useState<ModsValidationResult | null>(null);
   const [wizardModsError, setWizardModsError] = useState<string | null>(null);
   const [wizardModsBusy, setWizardModsBusy] = useState(false);
-  const [settingsAdvancedOpen, setSettingsAdvancedOpen] = useState(false);
   const [serverSettingsByName, setServerSettingsByName] = useState<Record<string, ServerSettings>>({});
   const [isMaximized, setIsMaximized] = useState(false);
   const lastStatusRef = useRef<ServerStatus>("STOPPED");
@@ -521,17 +527,27 @@ function App() {
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [mods, setMods] = useState<ModEntry[]>([]);
   const [modsLoading, setModsLoading] = useState(false);
+  const [modsBulkBusy, setModsBulkBusy] = useState(false);
   const [modpack, setModpack] = useState<ModpackManifest | null>(null);
   const [modSync, setModSync] = useState<ModSyncStatus | null>(null);
   const [modSyncLoading, setModSyncLoading] = useState(false);
   const [modSyncModalOpen, setModSyncModalOpen] = useState(false);
   const [modsModalOpen, setModsModalOpen] = useState(false);
+  const [modSyncChoiceOpen, setModSyncChoiceOpen] = useState(false);
+  const [modSyncChoiceBusy, setModSyncChoiceBusy] = useState(false);
+  const [modSyncChoiceError, setModSyncChoiceError] = useState<string | null>(null);
+  const [modSyncChoiceRemember, setModSyncChoiceRemember] = useState(false);
+  const [pendingLaunchAfterSync, setPendingLaunchAfterSync] = useState(false);
   const [clientStatus, setClientStatus] = useState<ClientDetectionResult | null>(null);
   const [clientChecking, setClientChecking] = useState(false);
   const [clientMismatchOpen, setClientMismatchOpen] = useState(false);
   const [clientMismatchDismissed, setClientMismatchDismissed] = useState(false);
+  const [loaderInstallOpen, setLoaderInstallOpen] = useState(false);
+  const [loaderInstallBusy, setLoaderInstallBusy] = useState(false);
+  const [loaderInstallError, setLoaderInstallError] = useState<string | null>(null);
   const [joinHelpOpen, setJoinHelpOpen] = useState(false);
   const [joinIp, setJoinIp] = useState<string | null>(null);
+  const [smartJoinDismissed, setSmartJoinDismissed] = useState(false);
   const [compatHelpOpen, setCompatHelpOpen] = useState(false);
   const [modMetaOpen, setModMetaOpen] = useState(false);
   const [modMetaPath, setModMetaPath] = useState<string | null>(null);
@@ -660,7 +676,10 @@ function App() {
     analytics_enabled: false,
     crash_reporting_enabled: false,
     analytics_endpoint: null,
-    launcher_path: null
+    launcher_path: null,
+    smart_join_panel_enabled: true,
+    notify_on_server_start: true,
+    mod_sync_mode: "ask"
   };
   const deferredWizardFilter = useDeferredValue(wizardVersionFilter);
   const deferredReinstallFilter = useDeferredValue(reinstallVersionFilter);
@@ -1050,7 +1069,7 @@ function App() {
 
   useEffect(() => {
     if (!uiToast) return;
-    const timeout = setTimeout(() => setUiToast(null), 6000);
+    const timeout = setTimeout(() => setUiToast(null), 3500);
     return () => clearTimeout(timeout);
   }, [uiToast]);
 
@@ -1106,9 +1125,17 @@ function App() {
       sendNotification({ title, body });
     };
 
+    const serverName =
+      (activeServerId && servers.find((server) => server.name === activeServerId)?.name) ||
+      selectedServer?.name ||
+      "Server";
+
     if (status === "RUNNING" && prev !== "RUNNING") {
       setUiToast({ tone: "success", message: "Your server is up and running!" });
-      notify("Gamehost ONE", "Your server is up and running!");
+      if (effectiveAppSettings.notify_on_server_start !== false) {
+        notify("Server is running", `${serverName} is now online.`);
+      }
+      setSmartJoinDismissed(false);
     }
     if (status === "ERROR" && prev !== "ERROR") {
       setUiToast({ tone: "error", message: "Server failed to start. Check logs." });
@@ -1118,9 +1145,10 @@ function App() {
       setUiToast({ tone: "success", message: "Server stopped." });
       notify("Gamehost ONE", "Server stopped.");
       setActivePlayers(0);
+      setSmartJoinDismissed(false);
     }
     lastStatusRef.current = status;
-  }, [status]);
+  }, [status, activeServerId, servers, selectedServer, effectiveAppSettings.notify_on_server_start]);
 
   useEffect(() => {
     if (!isTauri) return;
@@ -1141,6 +1169,13 @@ function App() {
     };
 
     initAppData();
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri) return;
+    getVersion()
+      .then((version) => setAppVersion(version))
+      .catch(() => setAppVersion(null));
   }, []);
 
   useEffect(() => {
@@ -1296,7 +1331,7 @@ function App() {
   };
 
   const handleOpenWizard = () => {
-    setView("wizard");
+    changeView("wizard");
     if (tutorialActive && activeTutorialStep?.id === "create") {
       nextTutorial();
     }
@@ -1392,7 +1427,7 @@ function App() {
       setServers((prev) => [...prev, created]);
       setSelectedServer(created);
       setServerSettingsByName((prev) => ({ ...prev, [created.name]: wizardSettings }));
-      setView("servers");
+      changeView("servers");
       await loadServerIcons([created]);
       await loadMotd(created);
       await loadBackups(created);
@@ -1433,7 +1468,7 @@ function App() {
     setServers((prev) => [...prev, created]);
     setSelectedServer(created);
     setServerSettingsByName((prev) => ({ ...prev, [created.name]: DEFAULT_SETTINGS }));
-    setView("servers");
+    changeView("servers");
     await loadServerIcons([created]);
     await loadMotd(created);
     await loadBackups(created);
@@ -1560,7 +1595,38 @@ function App() {
       setLauncherChoiceOpen(true);
       return;
     }
-    await launchMinecraft(launcherChoice);
+    if (!isTauri) return;
+    if (!selectedServer) {
+      await launchMinecraft(launcherChoice);
+      return;
+    }
+
+    const modsEnabled = selectedServer.server_type === "forge" || selectedServer.server_type === "fabric";
+    const rawSyncMode = effectiveAppSettings.mod_sync_mode ?? "ask";
+    const syncMode = rawSyncMode === "copy" ? "metadata" : rawSyncMode;
+    if (modsEnabled) {
+      if (syncMode === "ask") {
+        setModSyncChoiceRemember(false);
+        setModSyncChoiceError(null);
+        setPendingLaunchAfterSync(true);
+        setModSyncChoiceOpen(true);
+        return;
+      }
+      try {
+        if (syncMode === "metadata") {
+          await syncModsWithMetadata(selectedServer);
+          if (rawSyncMode === "copy") {
+            await saveAppSettings({ ...effectiveAppSettings, mod_sync_mode: "metadata" });
+          }
+        }
+      } catch (err) {
+        setModSyncChoiceError(String(err));
+        setModSyncChoiceOpen(true);
+        return;
+      }
+    }
+
+    await performLaunchForServer(selectedServer);
   };
 
   const handleChooseLauncher = async (choice: LauncherChoice) => {
@@ -1619,20 +1685,82 @@ function App() {
     }
   };
 
+  const fetchModSyncStatus = async (server: ServerConfig) => {
+    if (!isTauri) return null;
+    const sync = await invoke<ModSyncStatus>("check_mod_sync", { serverId: server.name });
+    setModSync(sync);
+    return sync;
+  };
+
+  const syncModsWithMetadata = async (server: ServerConfig) => {
+    const sync = await fetchModSyncStatus(server);
+    const missingIds = (sync?.mods ?? [])
+      .filter((entry) => entry.status === "missing")
+      .map((entry) => entry.id);
+    if (missingIds.length === 0) {
+      return;
+    }
+    await invoke("download_mods", { serverId: server.name, modIds: missingIds });
+    await refreshModSync(server);
+  };
+
+  const performLaunchForServer = async (server: ServerConfig) => {
+    if (!launcherChoice) {
+      setLauncherChoiceOpen(true);
+      return;
+    }
+    if (!isTauri) return;
+    const required = resolveRequiredClient(server, serverMetadata);
+    if (required.loader !== "vanilla") {
+      setLoaderInstallOpen(true);
+      setLoaderInstallBusy(true);
+      setLoaderInstallError(null);
+      try {
+        const installed = await ensureClientLoaderInstalled(required);
+        await createLauncherProfile(installed.versionId, server.name);
+        await launchMinecraftClient(launcherChoice, installed.versionId, server.name);
+        setLauncherOpenedAt(Date.now());
+      } catch (err) {
+        setLoaderInstallError(String(err));
+        setLoaderInstallBusy(false);
+        return;
+      }
+      setLoaderInstallBusy(false);
+      setLoaderInstallOpen(false);
+      return;
+    }
+    await launchMinecraftClient(launcherChoice, required.versionId, server.name);
+    setLauncherOpenedAt(Date.now());
+  };
+
   const handleJoinServer = async () => {
     if (!selectedServer) return;
-    if (!clientStatus?.running) {
-      await handleLaunchMinecraft();
+    if (!launcherChoice) {
+      setLauncherChoiceOpen(true);
+      return;
     }
-    let ip = network?.local_ip ?? "127.0.0.1";
-    try {
-      const info = await invoke<NetworkInfo>("get_network_info", { port: selectedServer.port });
-      setNetwork(info);
-      ip = info.local_ip;
-    } catch {
-      // Ignore and fall back to existing IP.
+    if (!isTauri) return;
+    const required = resolveRequiredClient(selectedServer, serverMetadata);
+    if (required.loader !== "vanilla") {
+      setLoaderInstallOpen(true);
+      setLoaderInstallBusy(true);
+      setLoaderInstallError(null);
+      try {
+        const installed = await ensureClientLoaderInstalled(required);
+        await createLauncherProfile(installed.versionId, selectedServer.name);
+        await launchMinecraftClient(launcherChoice, installed.versionId, selectedServer.name);
+        setLauncherOpenedAt(Date.now());
+      } catch (err) {
+        setLoaderInstallError(String(err));
+        setLoaderInstallBusy(false);
+        return;
+      }
+      setLoaderInstallBusy(false);
+      setLoaderInstallOpen(false);
+    } else if (!clientStatus?.running) {
+      await launchMinecraft(launcherChoice);
     }
-    const address = `${ip}:${selectedServer.port}`;
+    const address = await resolveServerAddress(selectedServer);
     try {
       await navigator.clipboard?.writeText(address);
     } catch {
@@ -1641,6 +1769,31 @@ function App() {
     setUiToast({ tone: "success", message: "Server IP copied to clipboard" });
     setJoinIp(address);
     setJoinHelpOpen(true);
+  };
+
+  const handleInviteFriends = async () => {
+    if (!selectedServer) return;
+    const address = await resolveServerAddress(selectedServer);
+    try {
+      await navigator.clipboard?.writeText(address);
+    } catch {
+      // Ignore clipboard errors and still show helper.
+    }
+    setUiToast({ tone: "success", message: "Server IP copied to clipboard" });
+    setJoinIp(address);
+    setJoinHelpOpen(true);
+  };
+
+  const resolveServerAddress = async (server: ServerConfig) => {
+    let ip = network?.local_ip ?? "127.0.0.1";
+    try {
+      const info = await invoke<NetworkInfo>("get_network_info", { port: server.port });
+      setNetwork(info);
+      ip = info.local_ip;
+    } catch {
+      // Ignore and fall back to existing IP.
+    }
+    return `${ip}:${server.port}`;
   };
 
   const handleOpenForgeDownload = async () => {
@@ -1655,18 +1808,14 @@ function App() {
 
   const openClientModsFolder = async () => {
     try {
-      if (selectedServer?.server_dir) {
-        const modsDir = await join(selectedServer.server_dir, "mods");
-        if (await exists(modsDir)) {
-          await openPath(modsDir);
-        } else {
-          await openPath(selectedServer.server_dir);
-        }
-        return;
-      }
       const base = await dataDir();
       const modsDir = await join(base, ".minecraft", "mods");
-      await openPath(modsDir);
+      if (await exists(modsDir)) {
+        await openPath(modsDir);
+      } else {
+        const minecraftDir = await join(base, ".minecraft");
+        await openPath(minecraftDir);
+      }
     } catch (err) {
       setUiToast({ tone: "error", message: String(err) });
     }
@@ -1880,11 +2029,32 @@ function App() {
     }
   };
 
+  const handleOpenBackupsFolder = async () => {
+    if (!selectedServer) return;
+    try {
+      const base = appDataPath ?? (await appDataDir());
+      const backupsDir = await join(base, "backups", selectedServer.name);
+      if (await exists(backupsDir)) {
+        await openPath(backupsDir);
+      } else {
+        await openPath(base);
+      }
+    } catch (err) {
+      setUiToast({ tone: "error", message: String(err) });
+    }
+  };
+
   const handleRestoreBackup = async (entry: BackupEntry) => {
     if (!selectedServer || !isTauri) return;
-    const ok = await confirm("Restore this backup? Current world will be replaced.", {
-      title: "Restore backup"
-    });
+    let ok = false;
+    try {
+      ok = await confirm("Restore this backup? Current world will be replaced.", {
+        title: "Restore backup"
+      });
+    } catch (err) {
+      setUiToast({ tone: "error", message: String(err) });
+      return;
+    }
     if (!ok) return;
     try {
       await invoke("restore_backup", { serverId: selectedServer.name, backupId: entry.id });
@@ -1896,9 +2066,15 @@ function App() {
 
   const handleDeleteBackup = async (entry: BackupEntry) => {
     if (!selectedServer || !isTauri) return;
-    const ok = await confirm("Delete this backup? This cannot be undone.", {
-      title: "Delete backup"
-    });
+    let ok = false;
+    try {
+      ok = await confirm("Delete this backup? This cannot be undone.", {
+        title: "Delete backup"
+      });
+    } catch (err) {
+      setUiToast({ tone: "error", message: String(err) });
+      return;
+    }
     if (!ok) return;
     try {
       await invoke("delete_backup", { serverId: selectedServer.name, backupId: entry.id });
@@ -1927,7 +2103,7 @@ function App() {
       if (activeServerId === activeTarget.name) {
         setActiveServerId(null);
       }
-      setView("servers");
+      changeView("servers");
       setUiToast({ tone: "success", message: "Server deleted." });
     } catch (err) {
       setUiToast({ tone: "error", message: String(err) });
@@ -2059,7 +2235,7 @@ function App() {
       });
       setServers((prev) => [...prev, created]);
       setSelectedServer(created);
-      setView("servers");
+      changeView("servers");
       setImportOpen(false);
       setImportPath(null);
       setImportAnalysis(null);
@@ -2115,6 +2291,24 @@ function App() {
     }
   };
 
+  const handleDeleteAllMods = async () => {
+    if (!selectedServer || !isTauri) return;
+    const ok = await confirm("Delete all mods from this server? This cannot be undone.", {
+      title: "Delete all mods"
+    });
+    if (!ok) return;
+    setModsBulkBusy(true);
+    try {
+      const deleted = await invoke<number>("delete_all_mods", { serverId: selectedServer.name });
+      await loadMods(selectedServer);
+      setUiToast({ tone: "success", message: `Deleted ${deleted} mods.` });
+    } catch (err) {
+      setUiToast({ tone: "error", message: String(err) });
+    } finally {
+      setModsBulkBusy(false);
+    }
+  };
+
   const handleAddModWithMeta = async () => {
     if (!selectedServer || !isTauri || !modMetaPath) return;
     setModMetaBusy(true);
@@ -2144,7 +2338,7 @@ function App() {
 
   const handleOpenServer = (server: ServerConfig) => {
     setSelectedServer(server);
-    setView("detail");
+    changeView("detail");
   };
 
   const serverStatusFor = (server: ServerConfig) => {
@@ -2165,6 +2359,8 @@ function App() {
         ? "fabric"
         : "vanilla"
       : "vanilla");
+  const forgeInstallersVisible =
+    serverLoader === "forge" && (serverMetadata?.modCount ?? 0) > 0;
   const clientLoader = clientStatus?.loader ?? "vanilla";
   const clientVersion = clientStatus?.mcVersion ?? null;
   const comparison = compareClientToServer(clientStatus, selectedServer);
@@ -2458,6 +2654,8 @@ function App() {
   const showSidebar = view !== "loading";
   const isServerView = view === "detail";
   const activeTutorialStep = tutorialActive ? TUTORIAL_STEPS[tutorialStepIndex] : null;
+  const changeView = (next: View) => startViewTransition(() => setView(next));
+  const changeDetailTab = (next: string) => startViewTransition(() => setDetailTab(next));
 
   const stopTutorial = (options?: { neverShow?: boolean }) => {
     if (options?.neverShow) {
@@ -2493,11 +2691,43 @@ function App() {
       >
         <TitleBar uiToast={uiToast} onMinimize={handleMinimize} onMaximize={handleMaximize} onClose={handleClose} />
 
+        {serverReady && effectiveAppSettings.smart_join_panel_enabled && !smartJoinDismissed && (
+          <motion.div
+            variants={item}
+            className="fixed bottom-6 right-6 z-40 w-full max-w-xs rounded-3xl border border-white/10 bg-surface/95 p-4 text-sm text-text shadow-soft"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <img src="/MC-logo.webp" alt="Minecraft" className="h-8 w-8 object-contain" />
+                <div>
+                  <p className="text-xs uppercase tracking-[0.2em] text-muted">Minecraft</p>
+                  <p className="text-sm font-semibold text-text">Server is running</p>
+                </div>
+              </div>
+              <button
+                className="rounded-full border border-white/10 px-2.5 py-1 text-xs text-muted transition hover:bg-white/10 hover:text-text"
+                onClick={() => setSmartJoinDismissed(true)}
+              >
+                Close
+              </button>
+            </div>
+            <div className="mt-4 flex flex-wrap items-center gap-2">
+              <PrimaryButton onClick={handleJoinServer}>
+                Join Server
+              </PrimaryButton>
+              <SubtleButton onClick={handleInviteFriends}>
+                Invite Friends
+              </SubtleButton>
+            </div>
+          </motion.div>
+        )}
+
+
         <div className="flex flex-1 min-h-0">
           {showSidebar && (
             <Sidebar
               view={view}
-              setView={setView}
+              setView={changeView}
               sidebarExpanded={sidebarExpanded}
               setSidebarExpanded={setSidebarExpanded}
               servers={servers}
@@ -2510,10 +2740,20 @@ function App() {
           )}
           <div className="content-scroll flex-1 min-h-0 overflow-y-auto px-6 pb-12 pt-8 lg:px-12">
           {fatalError && (
-            <div className="pointer-events-none fixed inset-x-0 top-6 z-50 mx-auto flex max-w-3xl items-center justify-center px-4">
+            <div className="fixed inset-x-0 top-6 z-50 mx-auto flex max-w-3xl items-center justify-center px-4">
               <div className="w-full rounded-3xl border border-danger/30 bg-danger/15 p-4">
-                <p className="text-xs uppercase tracking-[0.2em] text-danger">UI error</p>
-                <p className="mt-2 text-sm text-text">{fatalError}</p>
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.2em] text-danger">UI error</p>
+                    <p className="mt-2 text-sm text-text">{fatalError}</p>
+                  </div>
+                  <button
+                    className="rounded-full border border-white/10 px-3 py-1 text-xs text-muted transition hover:bg-white/10 hover:text-text"
+                    onClick={() => setFatalError(null)}
+                  >
+                    Dismiss
+                  </button>
+                </div>
               </div>
             </div>
           )}
@@ -2635,6 +2875,46 @@ function App() {
             onPickLauncherPath={handlePickLauncherPath}
             onClearLauncherPath={handleClearLauncherPath}
           />
+          {loaderInstallOpen && (
+            <div className="fixed inset-0 z-60 flex items-center justify-center bg-black/60 px-6">
+              <div className="w-full max-w-sm rounded-3xl border border-white/10 bg-surface p-6 text-sm text-text shadow-soft">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.2em] text-muted">Launcher</p>
+                    <h3 className="mt-2 font-display text-xl text-text">
+                      {loaderInstallBusy ? "Installing loader" : "Install failed"}
+                    </h3>
+                  </div>
+                  <button
+                    className="rounded-full border border-white/10 px-3 py-1 text-xs text-muted transition hover:bg-white/10 hover:text-text"
+                    onClick={() => setLoaderInstallOpen(false)}
+                    disabled={loaderInstallBusy}
+                  >
+                    Close
+                  </button>
+                </div>
+                <div className="mt-4 grid gap-2 text-xs text-muted">
+                  {loaderInstallBusy ? (
+                    <p>Installing the required loader into your Minecraft launcher.</p>
+                  ) : (
+                    <p>{loaderInstallError ?? "Unable to install the loader."}</p>
+                  )}
+                </div>
+                {!loaderInstallBusy && (
+                  <div className="mt-5 flex flex-wrap items-center gap-3">
+                    <PrimaryButton
+                      onClick={() => {
+                        setLoaderInstallError(null);
+                        setLoaderInstallOpen(false);
+                      }}
+                    >
+                      Ok
+                    </PrimaryButton>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
           {clientMismatchOpen && selectedServer && clientStatus?.running && (
             <div className="fixed inset-0 z-60 flex items-center justify-center bg-black/60 px-6">
               <div className="w-full max-w-sm rounded-3xl border border-white/10 bg-surface p-6 text-sm text-text shadow-soft">
@@ -2748,12 +3028,21 @@ function App() {
                     <p className="text-xs uppercase tracking-[0.2em] text-muted">Mods</p>
                     <h3 className="mt-2 font-display text-xl text-text">Installed mods</h3>
                   </div>
-                  <button
-                    className="rounded-full border border-white/10 px-3 py-1 text-xs text-muted transition hover:bg-white/10 hover:text-text"
-                    onClick={() => setModsModalOpen(false)}
-                  >
-                    Close
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <SubtleButton
+                      onClick={handleDeleteAllMods}
+                      className="text-danger"
+                      disabled={modsLoading || modsBulkBusy}
+                    >
+                      Delete all
+                    </SubtleButton>
+                    <button
+                      className="rounded-full border border-white/10 px-3 py-1 text-xs text-muted transition hover:bg-white/10 hover:text-text"
+                      onClick={() => setModsModalOpen(false)}
+                    >
+                      Close
+                    </button>
+                  </div>
                 </div>
                 <div className="mt-4 max-h-[60vh] overflow-y-auto pr-2">
                   {modsLoading ? (
@@ -2804,6 +3093,96 @@ function App() {
                 </div>
                 <div className="mt-4 grid gap-2 text-xs text-muted">
                   <p>Open Minecraft → Multiplayer → Add Server → Paste IP</p>
+                </div>
+              </div>
+            </div>
+          )}
+          {modSyncChoiceOpen && selectedServer && (
+            <div className="fixed inset-0 z-60 flex items-center justify-center bg-black/60 px-6">
+              <div className="w-full max-w-md rounded-3xl border border-white/10 bg-surface p-6 text-sm text-text shadow-soft">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.2em] text-muted">Mods</p>
+                    <h3 className="mt-2 font-display text-xl text-text">Sync mods before launch</h3>
+                  </div>
+                  <button
+                    className="rounded-full border border-white/10 px-3 py-1 text-xs text-muted transition hover:bg-white/10 hover:text-text"
+                    onClick={() => {
+                      setModSyncChoiceOpen(false);
+                      setPendingLaunchAfterSync(false);
+                    }}
+                    disabled={modSyncChoiceBusy}
+                  >
+                    Close
+                  </button>
+                </div>
+                <div className="mt-4 grid gap-2 text-xs text-muted">
+                  <p>Choose how to sync mods for this server.</p>
+                  <p>Requires modpack metadata (ID + URL) to download client mods.</p>
+                </div>
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                  <SubtleButton onClick={openClientModsFolder} disabled={modSyncChoiceBusy}>
+                    Open client mods folder
+                  </SubtleButton>
+                </div>
+                {modSyncChoiceError && <p className="mt-3 text-xs text-danger">{modSyncChoiceError}</p>}
+                <div className="mt-5 grid gap-2">
+                  <PrimaryButton
+                    onClick={async () => {
+                      if (!selectedServer) return;
+                      setModSyncChoiceBusy(true);
+                      setModSyncChoiceError(null);
+                      try {
+                        await syncModsWithMetadata(selectedServer);
+                        if (modSyncChoiceRemember) {
+                          await saveAppSettings({ ...effectiveAppSettings, mod_sync_mode: "metadata" });
+                        }
+                        setModSyncChoiceBusy(false);
+                        setModSyncChoiceOpen(false);
+                        if (pendingLaunchAfterSync) {
+                          setPendingLaunchAfterSync(false);
+                          await performLaunchForServer(selectedServer);
+                        }
+                      } catch (err) {
+                        setModSyncChoiceError(String(err));
+                        setModSyncChoiceBusy(false);
+                      }
+                    }}
+                    disabled={modSyncChoiceBusy}
+                  >
+                    Sync using modpack metadata
+                  </PrimaryButton>
+                  <SubtleButton
+                    onClick={async () => {
+                      setModSyncChoiceOpen(false);
+                      if (pendingLaunchAfterSync && selectedServer) {
+                        setPendingLaunchAfterSync(false);
+                        await performLaunchForServer(selectedServer);
+                      } else {
+                        setPendingLaunchAfterSync(false);
+                      }
+                      if (modSyncChoiceRemember) {
+                        await saveAppSettings({ ...effectiveAppSettings, mod_sync_mode: "ask" });
+                      }
+                    }}
+                    disabled={modSyncChoiceBusy}
+                  >
+                    Skip for now
+                  </SubtleButton>
+                </div>
+                <div className="mt-4 flex items-center justify-between rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
+                  <div>
+                    <p className="text-sm font-semibold text-text">Remember my choice</p>
+                    <p className="text-xs text-muted">You can change this later in settings.</p>
+                  </div>
+                  <Switch.Root
+                    checked={modSyncChoiceRemember}
+                    onCheckedChange={setModSyncChoiceRemember}
+                    className="relative h-6 w-11 rounded-full bg-white/15 transition data-[state=checked]:bg-secondary"
+                    disabled={modSyncChoiceBusy}
+                  >
+                    <Switch.Thumb className="block h-5 w-5 translate-x-0.5 rounded-full bg-white transition data-[state=checked]:translate-x-5" />
+                  </Switch.Root>
                 </div>
               </div>
             </div>
@@ -2956,7 +3335,7 @@ function App() {
                 <button
                   className="group flex cursor-pointer flex-col gap-4 overflow-hidden rounded-3xl border border-white/10 bg-white/5 text-left transition hover:border-one/40 hover:bg-white/10"
                   onClick={() => {
-                    setView("servers");
+                    changeView("servers");
                     if (tutorialActive && activeTutorialStep?.id === "open-minecraft") {
                       nextTutorial();
                     }
@@ -3011,6 +3390,9 @@ function App() {
                     <h1 className="font-display text-3xl text-text">App Settings</h1>
                   </div>
                 </div>
+                {appVersion && (
+                  <span className="text-xs uppercase tracking-[0.2em] text-muted">v{appVersion}</span>
+                )}
               </motion.header>
 
               <motion.div variants={item} className="grid gap-6 lg:grid-cols-[1.2fr_1fr]">
@@ -3102,13 +3484,140 @@ function App() {
                     </div>
                   </Card>
 
+                  <Card title="Interface">
+                    <div className="grid gap-4">
+                      <SettingRow
+                        label="Smart Join Panel"
+                        description="Show a floating join card when your server is running."
+                      >
+                        <span
+                          className={classNames(
+                            "rounded-full px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.2em]",
+                            effectiveAppSettings.smart_join_panel_enabled
+                              ? "bg-secondary/20 text-secondary"
+                              : "bg-white/10 text-muted"
+                          )}
+                        >
+                          {effectiveAppSettings.smart_join_panel_enabled ? "On" : "Off"}
+                        </span>
+                        <Switch.Root
+                          checked={Boolean(effectiveAppSettings.smart_join_panel_enabled)}
+                          onCheckedChange={(value) =>
+                            saveAppSettings({ ...effectiveAppSettings, smart_join_panel_enabled: value })
+                          }
+                          className="relative h-6 w-11 rounded-full bg-white/15 transition data-[state=checked]:bg-secondary"
+                          disabled={appSettingsSaving}
+                        >
+                          <Switch.Thumb className="block h-5 w-5 translate-x-0.5 rounded-full bg-white transition data-[state=checked]:translate-x-5" />
+                        </Switch.Root>
+                      </SettingRow>
+                      <SettingRow
+                        label="Windows start notification"
+                        description="Show a native Windows notification when the server starts."
+                      >
+                        <span
+                          className={classNames(
+                            "rounded-full px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.2em]",
+                            effectiveAppSettings.notify_on_server_start
+                              ? "bg-secondary/20 text-secondary"
+                              : "bg-white/10 text-muted"
+                          )}
+                        >
+                          {effectiveAppSettings.notify_on_server_start ? "On" : "Off"}
+                        </span>
+                        <Switch.Root
+                          checked={Boolean(effectiveAppSettings.notify_on_server_start)}
+                          onCheckedChange={(value) =>
+                            saveAppSettings({ ...effectiveAppSettings, notify_on_server_start: value })
+                          }
+                          className="relative h-6 w-11 rounded-full bg-white/15 transition data-[state=checked]:bg-secondary"
+                          disabled={appSettingsSaving}
+                        >
+                          <Switch.Thumb className="block h-5 w-5 translate-x-0.5 rounded-full bg-white transition data-[state=checked]:translate-x-5" />
+                        </Switch.Root>
+                      </SettingRow>
+                      <SettingRow
+                        label="Mod sync on launch"
+                        description="Choose how to sync server mods when launching Minecraft."
+                      >
+                        <div className="flex flex-wrap items-center gap-2">
+                          {([
+                            { value: "ask", label: "Ask" },
+                            { value: "metadata", label: "Metadata" }
+                          ] as const).map((option) => (
+                            <SubtleButton
+                              key={option.value}
+                              className={classNames(
+                                effectiveAppSettings.mod_sync_mode === option.value
+                                  ? "bg-one/20 text-one ring-1 ring-one/40"
+                                  : ""
+                              )}
+                              onClick={() =>
+                                saveAppSettings({ ...effectiveAppSettings, mod_sync_mode: option.value })
+                              }
+                              disabled={appSettingsSaving}
+                            >
+                              {option.label}
+                            </SubtleButton>
+                          ))}
+                        </div>
+                      </SettingRow>
+                    </div>
+                  </Card>
+
+                </div>
+
+                <div className="grid gap-6">
+                  <Card title="About">
+                    <div className="grid gap-2">
+                      <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-2">
+                        <p className="text-xs uppercase tracking-[0.2em] text-muted">App data</p>
+                        <p className="mt-1 text-xs text-text break-all">{appDataDisplay}</p>
+                        <div className="mt-2 flex items-center gap-2">
+                          <SubtleButton onClick={openAppData}>Open folder</SubtleButton>
+                        </div>
+                      </div>
+                      <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-2">
+                        <p className="text-xs uppercase tracking-[0.2em] text-muted">Privacy</p>
+                        <p className="mt-1 text-xs text-muted">Read how we handle data and crashes.</p>
+                        <div className="mt-2 flex items-center gap-2">
+                          <SubtleButton onClick={() => openUrl(`https://github.com/${UPDATE_REPO}/blob/main/docs/privacy-policy.md`)}>
+                            View privacy policy
+                          </SubtleButton>
+                        </div>
+                      </div>
+                      <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-2">
+                        <p className="text-xs uppercase tracking-[0.2em] text-muted">Web</p>
+                        <div className="mt-2 flex items-center justify-between gap-4">
+                          <div className="flex items-center gap-2">
+                            <img src="/logo.png" alt="Gamehost ONE" className="h-5 w-5 rounded-md" />
+                            <p className="text-sm font-semibold text-text">
+                              Gamehost <span className="text-teal-300">ONE</span>
+                            </p>
+                          </div>
+                          <SubtleButton onClick={() => openUrl("https://gamehost-one-web.pages.dev/")}
+                          >
+                            <span className="flex items-center gap-2">
+                              <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                <circle cx="12" cy="12" r="10" />
+                                <path d="M2 12h20" />
+                                <path d="M12 2a15 15 0 0 1 0 20" />
+                                <path d="M12 2a15 15 0 0 0 0 20" />
+                              </svg>
+                              <span>Open</span>
+                            </span>
+                          </SubtleButton>
+                        </div>
+                      </div>
+                    </div>
+                  </Card>
                   <Card title="Crash Reports">
                     <div className="grid gap-4">
                       {crashReports.length === 0 ? (
                         <p className="text-sm text-muted">No crash reports recorded.</p>
                       ) : (
                         <div className="grid gap-2">
-                          {crashReports.map((report) => (
+                          {crashReports.slice(0, 3).map((report) => (
                             <div
                               key={report.file_name}
                               className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-white/10 bg-white/5 px-4 py-3"
@@ -3132,6 +3641,13 @@ function App() {
                           ))}
                         </div>
                       )}
+                      {crashReports.length > 3 && (
+                        <div className="flex items-center justify-end">
+                          <SubtleButton onClick={() => setCrashModalOpen(true)}>
+                            More reports
+                          </SubtleButton>
+                        </div>
+                      )}
                       {crashReports.length > 0 && (
                         <div className="flex items-center justify-end">
                           <div className="flex items-center gap-2">
@@ -3142,29 +3658,6 @@ function App() {
                           </div>
                         </div>
                       )}
-                    </div>
-                  </Card>
-                </div>
-
-                <div className="grid gap-6">
-                  <Card title="About">
-                    <div className="grid gap-4">
-                      <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
-                        <p className="text-xs uppercase tracking-[0.2em] text-muted">App data</p>
-                        <p className="mt-2 text-sm text-text break-all">{appDataDisplay}</p>
-                        <div className="mt-3 flex items-center gap-2">
-                          <SubtleButton onClick={openAppData}>Open folder</SubtleButton>
-                        </div>
-                      </div>
-                      <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
-                        <p className="text-xs uppercase tracking-[0.2em] text-muted">Privacy</p>
-                        <p className="mt-2 text-xs text-muted">Read how we handle data and crashes.</p>
-                        <div className="mt-3 flex items-center gap-2">
-                          <SubtleButton onClick={() => openUrl(`https://github.com/${UPDATE_REPO}/blob/main/docs/privacy-policy.md`)}>
-                            View privacy policy
-                          </SubtleButton>
-                        </div>
-                      </div>
                     </div>
                   </Card>
                 </div>
@@ -3189,7 +3682,7 @@ function App() {
                   <div className="flex items-center gap-4">
                     <button
                       className="rounded-full bg-white/10 px-3 py-2 text-xs font-semibold text-text transition hover:bg-white/20"
-                      onClick={() => setView("library")}
+                      onClick={() => changeView("library")}
                     >
                       Back
                     </button>
@@ -3206,7 +3699,7 @@ function App() {
                       label="Create Server"
                       onCreate={handleOpenWizard}
                       onImport={() => setImportOpen(true)}
-                      onMigrate={() => setView("migration")}
+                      onMigrate={() => changeView("migration")}
                       dataTutorial="create-server"
                     />
                   </div>
@@ -3222,7 +3715,7 @@ function App() {
                           label="Create your first server"
                           onCreate={handleOpenWizard}
                           onImport={() => setImportOpen(true)}
-                          onMigrate={() => setView("migration")}
+                          onMigrate={() => changeView("migration")}
                         />
                       </div>
                     </Card>
@@ -3357,7 +3850,7 @@ function App() {
               <motion.header variants={item} className="flex flex-wrap items-center gap-4">
                 <button
                   className="rounded-full bg-white/10 px-3 py-2 text-xs font-semibold text-text transition hover:bg-white/20"
-                  onClick={() => setView("servers")}
+                  onClick={() => changeView("servers")}
                 >
                   Back
                 </button>
@@ -3375,7 +3868,7 @@ function App() {
                   systemRamGb={systemRamGb}
                   safeRamMaxGb={safeRamMaxGb}
                   recommendedRamGb={recommendedRamGb}
-                  onBack={() => setView("servers")}
+                  onBack={() => changeView("servers")}
                   onCreate={handleMigrationCreate}
                 />
               </motion.div>
@@ -3394,7 +3887,7 @@ function App() {
               <motion.header variants={item} className="flex flex-wrap items-center gap-4">
                 <button
                   className="rounded-full bg-white/10 px-3 py-2 text-xs font-semibold text-text transition hover:bg-white/20"
-                  onClick={() => setView("servers")}
+                  onClick={() => changeView("servers")}
                 >
                   Back
                 </button>
@@ -3706,7 +4199,7 @@ function App() {
                 <div className="flex items-center gap-4">
                   <button
                     className="rounded-full bg-white/10 px-3 py-2 text-xs font-semibold text-text transition hover:bg-white/20"
-                    onClick={() => setView("servers")}
+                    onClick={() => changeView("servers")}
                   >
                     Back
                   </button>
@@ -3781,6 +4274,11 @@ function App() {
                       <SubtleButton onClick={() => setLauncherChoiceOpen(true)}>
                         Change launcher
                       </SubtleButton>
+                      {forgeInstallersVisible && (
+                        <SubtleButton onClick={handleOpenForgeDownload}>
+                          Forge installers
+                        </SubtleButton>
+                      )}
                     </div>
                   </div>
                   <p className="mt-3 text-[11px] text-muted">
@@ -3790,7 +4288,7 @@ function App() {
               )}
 
               <motion.div variants={item}>
-                <Tabs.Root value={detailTab} onValueChange={setDetailTab} className="grid gap-6">
+                <Tabs.Root value={detailTab} onValueChange={changeDetailTab} className="grid gap-6">
                   <Tabs.List className="relative flex flex-wrap items-center gap-2 rounded-3xl bg-surface px-5 py-4 shadow-soft ring-1 ring-white/5">
                     {[
                       {
@@ -3873,14 +4371,24 @@ function App() {
                     </div>
                   </Tabs.List>
 
-                  <Tabs.Content value="overview" className="grid gap-6 lg:grid-cols-[1.2fr_1fr]">
+                  <AnimatePresence mode="wait" initial={false}>
+                    {detailTab === "overview" && (
+                      <motion.div
+                        key="overview"
+                        layout
+                        className="grid gap-6 lg:grid-cols-[1.2fr_1fr]"
+                        initial={{ opacity: 0, y: 12 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: -12 }}
+                        transition={{ duration: 0.2 }}
+                      >
                     <div className="lg:col-span-2">
                       <Card
                         title="Server Setup"
                         action={
                           <button
                             className="group relative flex h-8 w-8 items-center justify-center rounded-full border border-white/10 text-muted transition hover:bg-white/10 hover:text-text"
-                            onClick={() => setDetailTab("settings")}
+                            onClick={() => changeDetailTab("settings")}
                             type="button"
                             aria-label="Server settings"
                           >
@@ -4070,14 +4578,12 @@ function App() {
                           <SubtleButton onClick={() => setLauncherChoiceOpen(true)}>
                             Change launcher
                           </SubtleButton>
-                        </div>
-                        {selectedServer?.server_type === "forge" && (
-                          <div className="flex flex-wrap items-center gap-2">
+                          {forgeInstallersVisible && (
                             <SubtleButton onClick={handleOpenForgeDownload}>
-                              Open Forge installer page
+                              Forge installers
                             </SubtleButton>
-                          </div>
-                        )}
+                          )}
+                        </div>
                         {selectedServer && (
                           <p className="text-xs text-muted">
                             Required: {selectedServer.version} · {getServerTypeLabel(selectedServer.server_type)}. Use Launch Minecraft to open the launcher.
@@ -4102,21 +4608,16 @@ function App() {
                           <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
                             <div className="flex items-center justify-between gap-3">
                               <p className="text-xs uppercase tracking-[0.2em] text-muted">Mod sync</p>
-                              <div className="flex items-center gap-2">
-                                <SubtleButton onClick={handleSyncModsCheck} disabled={modSyncLoading}>
-                                  {modSyncLoading ? "Checking..." : "Check"}
-                                </SubtleButton>
-                                <button
-                                  className="flex items-center gap-2 text-xs font-semibold text-muted transition hover:text-text"
-                                  onClick={openClientModsFolder}
-                                  type="button"
-                                >
-                                  <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                                    <path d="M3 7h5l2 2h11v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
-                                  </svg>
-                                  Server mods
-                                </button>
-                              </div>
+                              <button
+                                className="flex items-center gap-2 text-xs font-semibold text-muted transition hover:text-text"
+                                onClick={openClientModsFolder}
+                                type="button"
+                              >
+                                <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                  <path d="M3 7h5l2 2h11v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7z" />
+                                </svg>
+                                Client mods
+                              </button>
                             </div>
                             {modpack && (
                               <p className="mt-2 text-xs text-muted">
@@ -4124,25 +4625,40 @@ function App() {
                               </p>
                             )}
                             {modSync?.mods && modSync.mods.length > 0 ? (
-                              <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
-                                <p className="text-xs text-muted">Mods: {modSync.mods.length}</p>
+                              <div className="mt-3 flex items-center justify-end gap-2">
+                                <SubtleButton onClick={handleSyncModsCheck} disabled={modSyncLoading}>
+                                  {modSyncLoading ? "Checking..." : "Check"}
+                                </SubtleButton>
                                 <SubtleButton onClick={() => setModSyncModalOpen(true)}>View mod list</SubtleButton>
                               </div>
                             ) : (
-                              <p className="mt-3 text-xs text-muted">No modpack data yet.</p>
+                              <div className="mt-3 flex items-center justify-between gap-2">
+                                <p className="text-xs text-muted">No modpack data yet.</p>
+                                <SubtleButton onClick={handleSyncModsCheck} disabled={modSyncLoading}>
+                                  {modSyncLoading ? "Checking..." : "Check"}
+                                </SubtleButton>
+                              </div>
                             )}
                             {modSync?.mods?.some((entry) => entry.status === "unknown") && (
                               <p className="mt-3 text-xs text-muted">
-                                Client mods were not detected. If you use CurseForge or a custom profile, sync is unavailable.
+                                Client mods were not detected. Add client mods manually and re-check sync.
                               </p>
                             )}
                           </div>
                         )}
                       </div>
                     </Card>
-                  </Tabs.Content>
-
-                  <Tabs.Content value="console">
+                      </motion.div>
+                    )}
+                    {detailTab === "console" && (
+                      <motion.div
+                        key="console"
+                        layout
+                        initial={{ opacity: 0, y: 12 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: -12 }}
+                        transition={{ duration: 0.2 }}
+                      >
                     <Card title="Live Console">
                       <div className="grid gap-4">
                         <div className="h-72 overflow-y-auto rounded-2xl border border-white/10 bg-black/40 p-4 text-xs text-text">
@@ -4179,9 +4695,17 @@ function App() {
                         </div>
                       </div>
                     </Card>
-                  </Tabs.Content>
-
-                  <Tabs.Content value="settings">
+                      </motion.div>
+                    )}
+                    {detailTab === "settings" && (
+                      <motion.div
+                        key="settings"
+                        layout
+                        initial={{ opacity: 0, y: 12 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: -12 }}
+                        transition={{ duration: 0.2 }}
+                      >
                     <Card title="Server Settings">
                       <div className="grid gap-4">
                         <ServerSettingsFields
@@ -4286,9 +4810,7 @@ function App() {
                         )}
                         <div className="flex items-center justify-between">
                           <p className="text-xs text-muted">Settings update instantly for this server profile.</p>
-                          <SubtleButton onClick={() => setSettingsAdvancedOpen((prev) => !prev)}>
-                            {settingsAdvancedOpen ? "Hide advanced" : "Advanced settings"}
-                          </SubtleButton>
+                          <SubtleButton onClick={() => changeDetailTab("advanced")}>Advanced settings</SubtleButton>
                         </div>
                         <div className="flex items-center justify-between">
                           <p className="text-xs text-muted">Apply online-mode changes for this server.</p>
@@ -4296,20 +4818,20 @@ function App() {
                             {configSaving ? "Saving..." : "Apply access"}
                           </PrimaryButton>
                         </div>
-                        {settingsAdvancedOpen && (
-                          <div className="rounded-2xl border border-white/10 bg-white/5 p-4">
-                            <ServerSettingsFields
-                              settings={activeSettings}
-                              onChange={updateActiveSettings}
-                              variant="advanced"
-                            />
-                          </div>
-                        )}
                       </div>
                     </Card>
-                  </Tabs.Content>
-
-                  <Tabs.Content value="advanced" className="grid gap-6 lg:grid-cols-[1.1fr_1fr]">
+                      </motion.div>
+                    )}
+                    {detailTab === "advanced" && (
+                      <motion.div
+                        key="advanced"
+                        layout
+                        className="grid gap-6 lg:grid-cols-[1.1fr_1fr]"
+                        initial={{ opacity: 0, y: 12 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: -12 }}
+                        transition={{ duration: 0.2 }}
+                      >
                     <Card title="Advanced Settings">
                       <div className="grid gap-4">
                         <ServerSettingsFields
@@ -4591,6 +5113,9 @@ function App() {
                           <SubtleButton onClick={handleExportWorld}>
                             {exportProgress !== null ? "Exporting..." : "Export world"}
                           </SubtleButton>
+                          <SubtleButton onClick={handleOpenBackupsFolder}>
+                            Open backups folder
+                          </SubtleButton>
                         </div>
                         {backupProgress !== null && (
                           <div className="grid gap-2">
@@ -4695,7 +5220,9 @@ function App() {
                         </button>
                       </div>
                     </Card>
-                  </Tabs.Content>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
                 </Tabs.Root>
               </motion.div>
               </motion.div>
