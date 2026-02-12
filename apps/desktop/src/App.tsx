@@ -182,6 +182,7 @@ const MAX_VERSION_OPTIONS = 200;
 const MAX_VERSION_OPTIONS_FORGE = 5;
 const BACKUP_INTERVALS = [30, 60, 360, 1440] as const;
 const UPDATE_REPO = "Adlikkk/gamehost-one-app";
+const UPDATE_SKIP_CRASH_KEY = "gho_skip_crash_modal_once";
 
 type TutorialStep = {
   id: string;
@@ -2454,10 +2455,9 @@ function App() {
     setUpdateDownloading(true);
     setUpdateError(null);
     try {
-      const path = await invoke<string>("download_update", { downloadUrl: updateInfo.download_url });
-      await openPath(path);
+      window.localStorage.setItem(UPDATE_SKIP_CRASH_KEY, "true");
+      await invoke("install_update", { downloadUrl: updateInfo.download_url });
       setUpdateModalOpen(false);
-      setUiToast({ tone: "success", message: "Installer opened." });
     } catch (err) {
       const message = String(err);
       setUpdateError(message);
@@ -2472,8 +2472,8 @@ function App() {
     try {
       const reports = await invoke<CrashReportSummary[]>("list_crash_reports");
       setCrashReports(reports);
-      if (reports.length > 0) {
-        setCrashModalOpen(true);
+      if (window.localStorage.getItem(UPDATE_SKIP_CRASH_KEY)) {
+        window.localStorage.removeItem(UPDATE_SKIP_CRASH_KEY);
       }
     } catch (err) {
       setUiToast({ tone: "error", message: String(err) });
@@ -3233,10 +3233,10 @@ function App() {
                 <div className="mt-5 flex items-center justify-end gap-3">
                   <SubtleButton onClick={() => setUpdateModalOpen(false)}>Later</SubtleButton>
                   <PrimaryButton onClick={handleUpdateNow} disabled={updateDownloading || !updateInfo?.download_url}>
-                    {updateDownloading ? "Downloading..." : "Download update"}
+                    {updateDownloading ? "Downloading..." : "Update now"}
                   </PrimaryButton>
                 </div>
-                <p className="mt-3 text-xs text-muted">The installer will open after download completes.</p>
+                <p className="mt-3 text-xs text-muted">We will download and open the installer.</p>
               </div>
             </div>
           )}
@@ -4250,42 +4250,6 @@ function App() {
                   </SubtleButton>
                 </div>
               </motion.header>
-
-              {serverStatusFor(selectedServer) === "STARTING" && (
-                <motion.div
-                  variants={item}
-                  className="fixed right-6 top-28 z-40 w-full max-w-xs rounded-3xl border border-white/10 bg-surface/95 p-4 text-sm text-text shadow-soft"
-                >
-                  <div className="flex items-center gap-3">
-                    <img src="/MC-logo.webp" alt="Minecraft" className="h-10 w-10 object-contain" />
-                    <div>
-                      <p className="text-xs uppercase tracking-[0.2em] text-muted">Minecraft</p>
-                      <p className="text-sm font-semibold text-text">Your server is starting…</p>
-                    </div>
-                  </div>
-                  <p className="mt-3 text-xs text-muted">
-                    You can already launch Minecraft and join once it’s ready.
-                  </p>
-                  <div className="mt-4">
-                    <div className="flex items-center gap-2">
-                      <PrimaryButton onClick={handleLaunchMinecraft}>
-                        ▶ Launch Minecraft
-                      </PrimaryButton>
-                      <SubtleButton onClick={() => setLauncherChoiceOpen(true)}>
-                        Change launcher
-                      </SubtleButton>
-                      {forgeInstallersVisible && (
-                        <SubtleButton onClick={handleOpenForgeDownload}>
-                          Forge installers
-                        </SubtleButton>
-                      )}
-                    </div>
-                  </div>
-                  <p className="mt-3 text-[11px] text-muted">
-                    Please select version: {selectedServer.version} ({getServerTypeLabel(selectedServer.server_type)})
-                  </p>
-                </motion.div>
-              )}
 
               <motion.div variants={item}>
                 <Tabs.Root value={detailTab} onValueChange={changeDetailTab} className="grid gap-6">
