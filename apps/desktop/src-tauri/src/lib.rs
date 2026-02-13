@@ -28,12 +28,17 @@ use zip::{ZipArchive, ZipWriter, write::FileOptions};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 #[cfg(target_os = "windows")]
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HLOCAL, HWND, LocalFree};
 
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE,
     DWM_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND,
+};
+
+#[cfg(target_os = "windows")]
+use windows::Win32::Security::Cryptography::{
+    CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -178,6 +183,52 @@ struct ServerMeta {
     backup_interval_minutes: u32,
     #[serde(rename = "last_backup_at", alias = "lastBackupAt")]
     last_backup_at: Option<String>,
+    #[serde(rename = "discord_webhook_url", alias = "discordWebhookUrl", default)]
+    discord_webhook_url: Option<String>,
+    #[serde(rename = "discord_notify_start", alias = "discordNotifyStart", default = "default_discord_notify")]
+    discord_notify_start: bool,
+    #[serde(rename = "discord_notify_stop", alias = "discordNotifyStop", default = "default_discord_notify")]
+    discord_notify_stop: bool,
+    #[serde(rename = "discord_notify_crash", alias = "discordNotifyCrash", default = "default_discord_notify")]
+    discord_notify_crash: bool,
+    #[serde(rename = "discord_notify_ram", alias = "discordNotifyRam", default = "default_discord_notify")]
+    discord_notify_ram: bool,
+    #[serde(rename = "discord_template_start", alias = "discordTemplateStart", default)]
+    discord_template_start: String,
+    #[serde(rename = "discord_template_stop", alias = "discordTemplateStop", default)]
+    discord_template_stop: String,
+    #[serde(rename = "discord_template_crash", alias = "discordTemplateCrash", default)]
+    discord_template_crash: String,
+    #[serde(rename = "discord_template_ram", alias = "discordTemplateRam", default)]
+    discord_template_ram: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ServerMetaStorage {
+    #[serde(rename = "auto_backup", alias = "autoBackup")]
+    auto_backup: bool,
+    #[serde(rename = "backup_interval_minutes", alias = "backupIntervalMinutes")]
+    backup_interval_minutes: u32,
+    #[serde(rename = "last_backup_at", alias = "lastBackupAt")]
+    last_backup_at: Option<String>,
+    #[serde(rename = "discord_webhook_enc", alias = "discordWebhookEnc", default)]
+    discord_webhook_enc: Option<String>,
+    #[serde(rename = "discord_notify_start", alias = "discordNotifyStart", default = "default_discord_notify")]
+    discord_notify_start: bool,
+    #[serde(rename = "discord_notify_stop", alias = "discordNotifyStop", default = "default_discord_notify")]
+    discord_notify_stop: bool,
+    #[serde(rename = "discord_notify_crash", alias = "discordNotifyCrash", default = "default_discord_notify")]
+    discord_notify_crash: bool,
+    #[serde(rename = "discord_notify_ram", alias = "discordNotifyRam", default = "default_discord_notify")]
+    discord_notify_ram: bool,
+    #[serde(rename = "discord_template_start", alias = "discordTemplateStart", default)]
+    discord_template_start: Option<String>,
+    #[serde(rename = "discord_template_stop", alias = "discordTemplateStop", default)]
+    discord_template_stop: Option<String>,
+    #[serde(rename = "discord_template_crash", alias = "discordTemplateCrash", default)]
+    discord_template_crash: Option<String>,
+    #[serde(rename = "discord_template_ram", alias = "discordTemplateRam", default)]
+    discord_template_ram: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -215,6 +266,10 @@ struct AppSettings {
 
 fn default_mod_sync_mode() -> String {
     "ask".to_string()
+}
+
+fn default_discord_notify() -> bool {
+    true
 }
 
 fn default_notify_on_server_start() -> bool {
@@ -276,6 +331,15 @@ impl Default for ServerMeta {
             auto_backup: false,
             backup_interval_minutes: 60,
             last_backup_at: None,
+            discord_webhook_url: None,
+            discord_notify_start: true,
+            discord_notify_stop: true,
+            discord_notify_crash: true,
+            discord_notify_ram: true,
+            discord_template_start: String::new(),
+            discord_template_stop: String::new(),
+            discord_template_crash: String::new(),
+            discord_template_ram: String::new(),
         }
     }
 }
@@ -3017,18 +3081,144 @@ fn load_registry(path: &Path, legacy_path: &Path) -> Result<ServerRegistry, Stri
     Ok(ServerRegistry::default())
 }
 
+#[cfg(target_os = "windows")]
+fn encrypt_webhook(value: &str) -> Result<String, String> {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() {
+        return Ok(String::new());
+    }
+    let mut input = CRYPT_INTEGER_BLOB {
+        cbData: bytes.len() as u32,
+        pbData: bytes.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    if unsafe {
+        CryptProtectData(
+            &mut input,
+            None,
+            None,
+            None,
+            None,
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    }
+    .is_err()
+    {
+        return Err("Failed to encrypt webhook URL".to_string());
+    }
+    let slice = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) };
+    let encoded = general_purpose::STANDARD.encode(slice);
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(output.pbData as *mut core::ffi::c_void)));
+    }
+    Ok(encoded)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn encrypt_webhook(value: &str) -> Result<String, String> {
+    Ok(general_purpose::STANDARD.encode(value.as_bytes()))
+}
+
+#[cfg(target_os = "windows")]
+fn decrypt_webhook(value: &str) -> Option<String> {
+    let bytes = general_purpose::STANDARD.decode(value).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut input = CRYPT_INTEGER_BLOB {
+        cbData: bytes.len() as u32,
+        pbData: bytes.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB::default();
+    if unsafe {
+        CryptUnprotectData(
+            &mut input,
+            None,
+            None,
+            None,
+            None,
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    }
+    .is_err()
+    {
+        return None;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) };
+    let decoded = String::from_utf8(slice.to_vec()).ok();
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(output.pbData as *mut core::ffi::c_void)));
+    }
+    decoded
+}
+
+#[cfg(not(target_os = "windows"))]
+fn decrypt_webhook(value: &str) -> Option<String> {
+    let bytes = general_purpose::STANDARD.decode(value).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+fn meta_from_storage(storage: ServerMetaStorage) -> ServerMeta {
+    let url = storage
+        .discord_webhook_enc
+        .as_deref()
+        .and_then(decrypt_webhook)
+        .filter(|value| !value.trim().is_empty());
+
+    ServerMeta {
+        auto_backup: storage.auto_backup,
+        backup_interval_minutes: storage.backup_interval_minutes,
+        last_backup_at: storage.last_backup_at,
+        discord_webhook_url: url,
+        discord_notify_start: storage.discord_notify_start,
+        discord_notify_stop: storage.discord_notify_stop,
+        discord_notify_crash: storage.discord_notify_crash,
+        discord_notify_ram: storage.discord_notify_ram,
+        discord_template_start: storage.discord_template_start.unwrap_or_default(),
+        discord_template_stop: storage.discord_template_stop.unwrap_or_default(),
+        discord_template_crash: storage.discord_template_crash.unwrap_or_default(),
+        discord_template_ram: storage.discord_template_ram.unwrap_or_default(),
+    }
+}
+
+fn storage_from_meta(meta: &ServerMeta) -> Result<ServerMetaStorage, String> {
+    let webhook_enc = match meta.discord_webhook_url.as_deref() {
+        Some(value) if !value.trim().is_empty() => Some(encrypt_webhook(value)?),
+        _ => None,
+    };
+
+    Ok(ServerMetaStorage {
+        auto_backup: meta.auto_backup,
+        backup_interval_minutes: meta.backup_interval_minutes,
+        last_backup_at: meta.last_backup_at.clone(),
+        discord_webhook_enc: webhook_enc,
+        discord_notify_start: meta.discord_notify_start,
+        discord_notify_stop: meta.discord_notify_stop,
+        discord_notify_crash: meta.discord_notify_crash,
+        discord_notify_ram: meta.discord_notify_ram,
+        discord_template_start: Some(meta.discord_template_start.clone()),
+        discord_template_stop: Some(meta.discord_template_stop.clone()),
+        discord_template_crash: Some(meta.discord_template_crash.clone()),
+        discord_template_ram: Some(meta.discord_template_ram.clone()),
+    })
+}
+
 fn load_server_meta(base: &Path, server_name: &str) -> Result<ServerMeta, String> {
     let path = server_meta_path(base, server_name);
     if !path.exists() {
         return Ok(ServerMeta::default());
     }
     let content = fs::read_to_string(&path).map_err(|err| err.to_string())?;
-    serde_json::from_str(&content).map_err(|err| err.to_string())
+    let storage: ServerMetaStorage = serde_json::from_str(&content).map_err(|err| err.to_string())?;
+    Ok(meta_from_storage(storage))
 }
 
 fn save_server_meta(base: &Path, server_name: &str, meta: &ServerMeta) -> Result<(), String> {
     let path = server_meta_path(base, server_name);
-    let content = serde_json::to_string_pretty(meta).map_err(|err| err.to_string())?;
+    let storage = storage_from_meta(meta)?;
+    let content = serde_json::to_string_pretty(&storage).map_err(|err| err.to_string())?;
     fs::write(path, content).map_err(|err| err.to_string())
 }
 
