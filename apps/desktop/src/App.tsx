@@ -18,6 +18,7 @@ import { BrandName } from "./components/BrandName";
 import { TitleBar } from "./components/layout/TitleBar";
 import { Sidebar } from "./components/layout/Sidebar";
 import { DiscordSettings } from "./components/DiscordSettings";
+import { ConsoleView } from "./components/ConsoleView";
 import { CrashModal } from "./components/modals/CrashModal";
 import { DeleteServerModal } from "./components/modals/DeleteServerModal";
 import { ImportServerModal } from "./components/modals/ImportServerModal";
@@ -35,6 +36,7 @@ import { MigrationWizard, type MigrationCreatePayload } from "./wizard/Migration
 import { classNames } from "./utils/classNames";
 import { emitEvent, onEvent } from "./services/eventBus";
 import { DEFAULT_DISCORD_TEMPLATES, sendDiscordNotification } from "./services/webhookService";
+import { parseConsoleLine } from "./services/consoleParser";
 import { buildWorldImportPayload, pickAndValidateWorld } from "./services/worldImport";
 import { pickAndValidateMods } from "./services/modImport";
 import { detectServerMetadata } from "./services/modDetection";
@@ -74,6 +76,7 @@ import type {
   WorldImportPayload,
   WorldValidationResult
 } from "./types";
+import type { ConsoleEntry } from "./services/consoleParser";
 
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -385,7 +388,8 @@ const normalizeStatus = (value: string): ServerStatus => {
   return "STOPPED";
 };
 
-function getServerTypeLabel(value: ServerConfig["server_type"]) {
+function getServerTypeLabel(value: ServerConfig["server_type"] | string) {
+  if (!value || value === "unknown") return "Vanilla";
   return (
     IMPORT_SERVER_TYPES.find((type) => type.value === value)?.label ??
     value.charAt(0).toUpperCase() + value.slice(1)
@@ -393,7 +397,7 @@ function getServerTypeLabel(value: ServerConfig["server_type"]) {
 }
 
 function formatLoaderLabel(value?: string | null) {
-  if (!value || value === "none") return "Vanilla";
+  if (!value || value === "none" || value === "unknown") return "Vanilla";
   if (value === "quilt") return "Quilt";
   return value.charAt(0).toUpperCase() + value.slice(1);
 }
@@ -484,12 +488,11 @@ function App() {
   const [launcherChoice, setLauncherChoice] = useState<LauncherChoice | null>(null);
   const [launcherChoiceOpen, setLauncherChoiceOpen] = useState(false);
   const [launcherOpenedAt, setLauncherOpenedAt] = useState<number | null>(null);
-  const [consoleLines, setConsoleLines] = useState<string[]>([]);
+  const [consoleEntries, setConsoleEntries] = useState<ConsoleEntry[]>([]);
   const [installing, setInstalling] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [resource, setResource] = useState<ResourceUsage | null>(null);
   const [network, setNetwork] = useState<NetworkInfo | null>(null);
-  const [commandInput, setCommandInput] = useState("");
   const [appDataPath, setAppDataPath] = useState<string | null>(null);
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
@@ -534,6 +537,8 @@ function App() {
   const welcomeShownRef = useRef(false);
   const loadingAnimRef = useRef<HTMLDivElement | null>(null);
   const [activePlayers, setActivePlayers] = useState(0);
+  const [onlinePlayers, setOnlinePlayers] = useState<string[]>([]);
+  const [playerGamemodeDraft, setPlayerGamemodeDraft] = useState<Record<string, string>>({});
   const [detailTab, setDetailTab] = useState("overview");
   const [systemRamMb, setSystemRamMb] = useState<number | null>(null);
   const [ramDraft, setRamDraft] = useState(4);
@@ -560,8 +565,6 @@ function App() {
   const [pendingLaunchAfterSync, setPendingLaunchAfterSync] = useState(false);
   const [clientStatus, setClientStatus] = useState<ClientDetectionResult | null>(null);
   const [clientChecking, setClientChecking] = useState(false);
-  const [clientMismatchOpen, setClientMismatchOpen] = useState(false);
-  const [clientMismatchDismissed, setClientMismatchDismissed] = useState(false);
   const [loaderInstallOpen, setLoaderInstallOpen] = useState(false);
   const [loaderInstallBusy, setLoaderInstallBusy] = useState(false);
   const [loaderInstallError, setLoaderInstallError] = useState<string | null>(null);
@@ -766,16 +769,17 @@ function App() {
     window.addEventListener("error", handleError);
     window.addEventListener("unhandledrejection", handleRejection);
 
-    const loadingTimer = setTimeout(() => setView("library"), 3000);
     return () => {
       window.removeEventListener("error", handleError);
       window.removeEventListener("unhandledrejection", handleRejection);
-      clearTimeout(loadingTimer);
     };
   }, []);
 
   useEffect(() => {
-    if (!isTauri) return;
+    if (!isTauri) {
+      setView("library");
+      return;
+    }
 
     const init = async () => {
       try {
@@ -805,22 +809,38 @@ function App() {
         setStatus("STOPPED");
       }
 
-      await refreshNetwork();
+      await Promise.all([refreshNetwork(), loadAppSettings(), loadCrashReports(), handleCheckUpdates(true)]);
     };
 
-    init();
+    init().finally(() => setView("library"));
 
     const unlistenPromise = Promise.all([
       listen<string>("console_line", (event) => {
-        setConsoleLines((prev) => {
-          const next = [...prev, event.payload];
-          return next.length > 400 ? next.slice(-400) : next;
+        const parsed = parseConsoleLine(event.payload);
+        setConsoleEntries((prev) => {
+          const next = [...prev, parsed.entry];
+          return next.length > 2000 ? next.slice(-2000) : next;
         });
-        if (event.payload.includes(" joined the game")) {
-          setActivePlayers((prev) => Math.max(0, prev + 1));
+
+        if (parsed.playerList) {
+          setOnlinePlayers(parsed.playerList);
+          setActivePlayers(parsed.playerList.length);
         }
-        if (event.payload.includes(" left the game")) {
-          setActivePlayers((prev) => Math.max(0, prev - 1));
+
+        if (parsed.playerEvent) {
+          setOnlinePlayers((prev) => {
+            if (parsed.playerEvent?.type === "join") {
+              const next = new Set([...prev, parsed.playerEvent.name]);
+              setActivePlayers(next.size);
+              return Array.from(next);
+            }
+            if (parsed.playerEvent?.type === "leave") {
+              const next = prev.filter((name) => name !== parsed.playerEvent?.name);
+              setActivePlayers(next.length);
+              return next;
+            }
+            return prev;
+          });
         }
       }),
       listen("server:start", () => setStatus("STARTING")),
@@ -1046,8 +1066,10 @@ function App() {
 
   useEffect(() => {
     if (!selectedServer) return;
-    loadMotd(selectedServer);
+    setConsoleEntries([]);
+    setOnlinePlayers([]);
     setActivePlayers(0);
+    loadMotd(selectedServer);
     loadMods(selectedServer);
     loadBackups(selectedServer);
     loadServerMeta(selectedServer);
@@ -1176,6 +1198,7 @@ function App() {
       notify("Gamehost ONE", "Server stopped.");
       emitEvent("server:stop", webhookPayload);
       setActivePlayers(0);
+      setOnlinePlayers([]);
       setSmartJoinDismissed(false);
     }
     lastStatusRef.current = status;
@@ -1247,13 +1270,6 @@ function App() {
     getVersion()
       .then((version) => setAppVersion(version))
       .catch(() => setAppVersion(null));
-  }, []);
-
-  useEffect(() => {
-    if (!isTauri) return;
-    loadAppSettings();
-    loadCrashReports();
-    handleCheckUpdates(true);
   }, []);
 
   useEffect(() => {
@@ -1584,7 +1600,6 @@ function App() {
     }
     try {
       await invoke("send_console_command", { serverId: selectedServer.name, command });
-      setCommandInput("");
     } catch (err) {
       const message = String(err);
       setError(message);
@@ -1667,20 +1682,6 @@ function App() {
         selectedServer?.version ?? null,
         selectedServer?.name ?? null
       );
-      setLauncherOpenedAt(Date.now());
-    } catch (err) {
-      setUiToast({ tone: "error", message: String(err) });
-    }
-  };
-
-  const handleOpenLauncherOnly = async () => {
-    if (!launcherChoice) {
-      setLauncherChoiceOpen(true);
-      return;
-    }
-    if (!isTauri) return;
-    try {
-      await launchMinecraftClient(launcherChoice, null, null);
       setLauncherOpenedAt(Date.now());
     } catch (err) {
       setUiToast({ tone: "error", message: String(err) });
@@ -2499,23 +2500,6 @@ function App() {
     clientStatus?.running && serverReady && !versionMismatch && !loaderMismatch && !modMismatch
   );
 
-  useEffect(() => {
-    if (!clientStatus?.running) {
-      setClientMismatchDismissed(false);
-      setClientMismatchOpen(false);
-      return;
-    }
-    const mismatch = versionMismatch || loaderMismatch;
-    if (!mismatch) {
-      setClientMismatchDismissed(false);
-      setClientMismatchOpen(false);
-      return;
-    }
-    if (!clientMismatchDismissed) {
-      setClientMismatchOpen(true);
-    }
-  }, [clientStatus, versionMismatch, loaderMismatch, clientMismatchDismissed]);
-
   const openAppData = async () => {
     const targetPath = appDataPath ?? "C:\\Users\\Adam\\AppData\\Roaming\\com.gamehost.one";
     try {
@@ -3035,50 +3019,6 @@ function App() {
                     </PrimaryButton>
                   </div>
                 )}
-              </div>
-            </div>
-          )}
-          {clientMismatchOpen && selectedServer && clientStatus?.running && (
-            <div className="fixed inset-0 z-60 flex items-center justify-center bg-black/60 px-6">
-              <div className="w-full max-w-sm rounded-3xl border border-white/10 bg-surface p-6 text-sm text-text shadow-soft">
-                <div className="flex items-start justify-between gap-4">
-                  <div>
-                    <p className="text-xs uppercase tracking-[0.2em] text-muted">Compatibility</p>
-                    <h3 className="mt-2 font-display text-xl text-text">Incompatible client detected</h3>
-                  </div>
-                  <button
-                    className="rounded-full border border-white/10 px-3 py-1 text-xs text-muted transition hover:bg-white/10 hover:text-text"
-                    onClick={() => {
-                      setClientMismatchOpen(false);
-                      setClientMismatchDismissed(true);
-                    }}
-                  >
-                    Close
-                  </button>
-                </div>
-                <div className="mt-4 grid gap-2 rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
-                  <p className="text-xs uppercase tracking-[0.2em] text-muted">Server</p>
-                  <p className="text-sm text-text">
-                    {formatLoaderLabel(serverLoader)} {serverMetadata?.mcVersion ?? selectedServer.version}
-                  </p>
-                </div>
-                <div className="mt-3 grid gap-2 rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
-                  <p className="text-xs uppercase tracking-[0.2em] text-muted">Client</p>
-                  <p className="text-sm text-text">
-                    {formatLoaderLabel(clientLoader)} {clientVersion ?? "unknown"}
-                  </p>
-                </div>
-                <div className="mt-5 flex flex-wrap items-center gap-3">
-                  <PrimaryButton onClick={handleLaunchMinecraft}>Launch correct version</PrimaryButton>
-                  <SubtleButton
-                    onClick={() => {
-                      setClientMismatchDismissed(true);
-                      handleOpenLauncherOnly();
-                    }}
-                  >
-                    Open launcher
-                  </SubtleButton>
-                </div>
               </div>
             </div>
           )}
@@ -4628,6 +4568,53 @@ function App() {
                               {Math.min(activePlayers, activeSettings.maxPlayers)}/{activeSettings.maxPlayers}
                             </span>
                           </div>
+                          {onlinePlayers.length > 0 && (
+                            <div className="mt-3 grid gap-2">
+                              {onlinePlayers.map((player) => (
+                                <div
+                                  key={player}
+                                  className="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-white/10 bg-white/5 px-3 py-2"
+                                >
+                                  <span className="text-xs text-text">{player}</span>
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <SubtleButton onClick={() => sendCommand(`kick ${player}`)}>
+                                      Kick
+                                    </SubtleButton>
+                                    <SubtleButton onClick={() => sendCommand(`op ${player}`)}>
+                                      Op
+                                    </SubtleButton>
+                                    <div className="flex items-center gap-2">
+                                      <select
+                                        value={playerGamemodeDraft[player] ?? "survival"}
+                                        onChange={(event) =>
+                                          setPlayerGamemodeDraft((prev) => ({
+                                            ...prev,
+                                            [player]: event.target.value
+                                          }))
+                                        }
+                                        className="rounded-full border border-white/10 bg-white/10 px-2 py-1 text-[11px] text-text"
+                                      >
+                                        {"survival,creative,adventure,spectator".split(",").map((mode) => (
+                                          <option key={mode} value={mode}>
+                                            {mode}
+                                          </option>
+                                        ))}
+                                      </select>
+                                      <SubtleButton
+                                        onClick={() =>
+                                          sendCommand(
+                                            `gamemode ${playerGamemodeDraft[player] ?? "survival"} ${player}`
+                                          )
+                                        }
+                                      >
+                                        Gamemode
+                                      </SubtleButton>
+                                    </div>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          )}
                         </div>
                       </div>
                     </Card>
@@ -4788,40 +4775,11 @@ function App() {
                         transition={{ duration: 0.2 }}
                       >
                     <Card title="Live Console">
-                      <div className="grid gap-4">
-                        <div className="h-72 overflow-y-auto rounded-2xl border border-white/10 bg-black/40 p-4 text-xs text-text">
-                          {consoleLines.length === 0 ? (
-                            <p className="text-muted">Server output will appear here.</p>
-                          ) : (
-                            consoleLines.map((line, index) => (
-                              <p key={`${line}-${index}`} className="leading-relaxed">
-                                {line}
-                              </p>
-                            ))
-                          )}
-                        </div>
-                        <div className="flex flex-wrap gap-3">
-                          {["stop", "save-all", "list"].map((cmd) => (
-                            <SubtleButton key={cmd} onClick={() => sendCommand(cmd)}>
-                              {cmd}
-                            </SubtleButton>
-                          ))}
-                        </div>
-                        <div className="flex flex-col gap-3 md:flex-row">
-                          <input
-                            className="flex-1 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-text transition focus:border-one/60 focus:outline-none"
-                            placeholder="Send a command to the server"
-                            value={commandInput}
-                            onChange={(event) => setCommandInput(event.target.value)}
-                            onKeyDown={(event) => {
-                              if (event.key === "Enter") {
-                                sendCommand(commandInput);
-                              }
-                            }}
-                          />
-                          <PrimaryButton onClick={() => sendCommand(commandInput)}>Send</PrimaryButton>
-                        </div>
-                      </div>
+                      <ConsoleView
+                        entries={consoleEntries}
+                        players={onlinePlayers}
+                        onSendCommand={sendCommand}
+                      />
                     </Card>
                       </motion.div>
                     )}
