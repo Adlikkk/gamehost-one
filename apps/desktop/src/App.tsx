@@ -17,6 +17,7 @@ import { isPermissionGranted, requestPermission, sendNotification } from "@tauri
 import { BrandName } from "./components/BrandName";
 import { TitleBar } from "./components/layout/TitleBar";
 import { Sidebar } from "./components/layout/Sidebar";
+import { DiscordSettings } from "./components/DiscordSettings";
 import { CrashModal } from "./components/modals/CrashModal";
 import { DeleteServerModal } from "./components/modals/DeleteServerModal";
 import { ImportServerModal } from "./components/modals/ImportServerModal";
@@ -32,6 +33,8 @@ import { SettingRow } from "./components/ui/SettingRow";
 import { StatusPill } from "./components/ui/StatusPill";
 import { MigrationWizard, type MigrationCreatePayload } from "./wizard/MigrationWizard";
 import { classNames } from "./utils/classNames";
+import { emitEvent, onEvent } from "./services/eventBus";
+import { DEFAULT_DISCORD_TEMPLATES, sendDiscordNotification } from "./services/webhookService";
 import { buildWorldImportPayload, pickAndValidateWorld } from "./services/worldImport";
 import { pickAndValidateMods } from "./services/modImport";
 import { detectServerMetadata } from "./services/modDetection";
@@ -249,6 +252,21 @@ const DEFAULT_SETTINGS: ServerSettings = {
   allowFlight: false,
   maxPlayers: 20,
   viewDistance: 10
+};
+
+const DEFAULT_SERVER_META: ServerMeta = {
+  auto_backup: false,
+  backup_interval_minutes: 60,
+  last_backup_at: null,
+  discord_webhook_url: null,
+  discord_notify_start: true,
+  discord_notify_stop: true,
+  discord_notify_crash: true,
+  discord_notify_ram: true,
+  discord_template_start: DEFAULT_DISCORD_TEMPLATES.start,
+  discord_template_stop: DEFAULT_DISCORD_TEMPLATES.stop,
+  discord_template_crash: DEFAULT_DISCORD_TEMPLATES.crash,
+  discord_template_ram: DEFAULT_DISCORD_TEMPLATES.ram
 };
 
 const getDefaultVersion = (serverType: ServerConfig["server_type"]) => {
@@ -481,6 +499,7 @@ function App() {
   const [updateModalOpen, setUpdateModalOpen] = useState(false);
   const [updateDownloading, setUpdateDownloading] = useState(false);
   const [updateError, setUpdateError] = useState<string | null>(null);
+  const [discordModalOpen, setDiscordModalOpen] = useState(false);
   const [crashReports, setCrashReports] = useState<CrashReportSummary[]>([]);
   const [crashModalOpen, setCrashModalOpen] = useState(false);
   const [activeCrashReport, setActiveCrashReport] = useState<CrashReport | null>(null);
@@ -571,6 +590,7 @@ function App() {
   const [backupIncludeEnd, setBackupIncludeEnd] = useState(true);
   const [serverMeta, setServerMeta] = useState<ServerMeta | null>(null);
   const ramAlertRef = useRef<number | null>(null);
+  const ramWebhookRef = useRef(false);
   const lastChatWarnRef = useRef(0);
   const emergencyBackupRef = useRef(false);
   const [tutorialActive, setTutorialActive] = useState(false);
@@ -595,6 +615,10 @@ function App() {
   const activeSettings = selectedServer
     ? serverSettingsByName[selectedServer.name] ?? DEFAULT_SETTINGS
     : DEFAULT_SETTINGS;
+  const activeServerConfig = useMemo(
+    () => servers.find((server) => server.name === activeServerId) ?? selectedServer ?? null,
+    [servers, activeServerId, selectedServer]
+  );
 
   const normalizedStatus = normalizeStatus(status);
   const actionState = getActionState(normalizedStatus);
@@ -1130,26 +1154,72 @@ function App() {
       (activeServerId && servers.find((server) => server.name === activeServerId)?.name) ||
       selectedServer?.name ||
       "Server";
+    const ip = network?.public_ip || network?.local_ip || "localhost";
+    const port = activeServerConfig?.port ?? selectedServer?.port ?? 25565;
+    const webhookPayload = { serverName, ip, port };
 
     if (status === "RUNNING" && prev !== "RUNNING") {
       setUiToast({ tone: "success", message: "Your server is up and running!" });
       if (effectiveAppSettings.notify_on_server_start !== false) {
         notify("Server is running", `${serverName} is now online.`);
       }
+      emitEvent("server:start", webhookPayload);
       setSmartJoinDismissed(false);
     }
     if (status === "ERROR" && prev !== "ERROR") {
       setUiToast({ tone: "error", message: "Server failed to start. Check logs." });
       notify("Gamehost ONE", "Server failed to start. Check logs.");
+      emitEvent("server:crash", webhookPayload);
     }
     if (status === "STOPPED" && prev !== "STOPPED") {
       setUiToast({ tone: "success", message: "Server stopped." });
       notify("Gamehost ONE", "Server stopped.");
+      emitEvent("server:stop", webhookPayload);
       setActivePlayers(0);
       setSmartJoinDismissed(false);
     }
     lastStatusRef.current = status;
-  }, [status, activeServerId, servers, selectedServer, effectiveAppSettings.notify_on_server_start]);
+  }, [
+    status,
+    activeServerId,
+    servers,
+    selectedServer,
+    activeServerConfig,
+    network,
+    effectiveAppSettings.notify_on_server_start
+  ]);
+
+  useEffect(() => {
+    if (!selectedServer || !serverMeta) return;
+    const config = {
+      url: serverMeta.discord_webhook_url ?? null,
+      notifyStart: serverMeta.discord_notify_start ?? true,
+      notifyStop: serverMeta.discord_notify_stop ?? true,
+      notifyCrash: serverMeta.discord_notify_crash ?? true,
+      notifyRam: serverMeta.discord_notify_ram ?? true,
+      templateStart: serverMeta.discord_template_start || DEFAULT_DISCORD_TEMPLATES.start,
+      templateStop: serverMeta.discord_template_stop || DEFAULT_DISCORD_TEMPLATES.stop,
+      templateCrash: serverMeta.discord_template_crash || DEFAULT_DISCORD_TEMPLATES.crash,
+      templateRam: serverMeta.discord_template_ram || DEFAULT_DISCORD_TEMPLATES.ram
+    };
+
+    const handle = (eventType: Parameters<typeof sendDiscordNotification>[0]) =>
+      (payload: Parameters<typeof sendDiscordNotification>[1]) => {
+        sendDiscordNotification(eventType, payload, config).catch(() => {});
+      };
+
+    const offStart = onEvent("server:start", handle("server:start"));
+    const offStop = onEvent("server:stop", handle("server:stop"));
+    const offCrash = onEvent("server:crash", handle("server:crash"));
+    const offRam = onEvent("ram:high", handle("ram:high"));
+
+    return () => {
+      offStart();
+      offStop();
+      offCrash();
+      offRam();
+    };
+  }, [selectedServer, serverMeta]);
 
   useEffect(() => {
     if (!isTauri) return;
@@ -1254,6 +1324,7 @@ function App() {
     if (memoryPercent < 80) {
       ramAlertRef.current = null;
       emergencyBackupRef.current = false;
+      ramWebhookRef.current = false;
       return;
     }
 
@@ -1278,6 +1349,22 @@ function App() {
       }
     }
 
+    if (threshold >= 95 && !ramWebhookRef.current) {
+      const serverName =
+        (activeServerId && servers.find((server) => server.name === activeServerId)?.name) ||
+        selectedServer?.name ||
+        "Server";
+      const ip = network?.public_ip || network?.local_ip || "localhost";
+      const port = activeServerConfig?.port ?? selectedServer?.port ?? 25565;
+      emitEvent("ram:high", {
+        serverName,
+        ip,
+        port,
+        ramPercent: Math.round(memoryPercent)
+      });
+      ramWebhookRef.current = true;
+    }
+
     if (threshold >= 95 && !emergencyBackupRef.current) {
       emergencyBackupRef.current = true;
       invoke<BackupEntry>("create_backup", {
@@ -1294,7 +1381,16 @@ function App() {
         .catch(() => {});
       setUiToast({ tone: "error", message: "Emergency backup created due to high RAM usage.", label: "Backup" });
     }
-  }, [activeServerId, status, memoryPercent, ramAlertLevel, selectedServer]);
+  }, [
+    activeServerId,
+    status,
+    memoryPercent,
+    ramAlertLevel,
+    selectedServer,
+    servers,
+    activeServerConfig,
+    network
+  ]);
 
   const handleMinimize = async () => {
     if (!isTauri) return;
@@ -2185,14 +2281,31 @@ function App() {
     if (!isTauri) return;
     try {
       const meta = await invoke<ServerMeta>("get_server_meta", { serverId: server.name });
-      setServerMeta(meta);
+      const normalized = {
+        ...DEFAULT_SERVER_META,
+        ...meta,
+        discord_template_start: meta.discord_template_start || DEFAULT_DISCORD_TEMPLATES.start,
+        discord_template_stop: meta.discord_template_stop || DEFAULT_DISCORD_TEMPLATES.stop,
+        discord_template_crash: meta.discord_template_crash || DEFAULT_DISCORD_TEMPLATES.crash,
+        discord_template_ram: meta.discord_template_ram || DEFAULT_DISCORD_TEMPLATES.ram
+      };
+      setServerMeta(normalized);
     } catch {
-      setServerMeta({ auto_backup: false, backup_interval_minutes: 60, last_backup_at: null });
+      setServerMeta(DEFAULT_SERVER_META);
     }
   };
 
-  const saveServerMeta = async (next: ServerMeta) => {
+  const saveServerMeta = async (patch: Partial<ServerMeta>) => {
     if (!selectedServer || !isTauri) return;
+    const base = serverMeta ?? DEFAULT_SERVER_META;
+    const next = {
+      ...base,
+      ...patch,
+      discord_template_start: (patch.discord_template_start ?? base.discord_template_start) || DEFAULT_DISCORD_TEMPLATES.start,
+      discord_template_stop: (patch.discord_template_stop ?? base.discord_template_stop) || DEFAULT_DISCORD_TEMPLATES.stop,
+      discord_template_crash: (patch.discord_template_crash ?? base.discord_template_crash) || DEFAULT_DISCORD_TEMPLATES.crash,
+      discord_template_ram: (patch.discord_template_ram ?? base.discord_template_ram) || DEFAULT_DISCORD_TEMPLATES.ram
+    };
     setServerMeta(next);
     try {
       await invoke("update_server_meta", {
@@ -2200,7 +2313,16 @@ function App() {
         meta: {
           autoBackup: next.auto_backup,
           backupIntervalMinutes: next.backup_interval_minutes,
-          lastBackupAt: next.last_backup_at ?? null
+          lastBackupAt: next.last_backup_at ?? null,
+          discordWebhookUrl: next.discord_webhook_url ?? null,
+          discordNotifyStart: next.discord_notify_start ?? true,
+          discordNotifyStop: next.discord_notify_stop ?? true,
+          discordNotifyCrash: next.discord_notify_crash ?? true,
+          discordNotifyRam: next.discord_notify_ram ?? true,
+          discordTemplateStart: next.discord_template_start,
+          discordTemplateStop: next.discord_template_stop,
+          discordTemplateCrash: next.discord_template_crash,
+          discordTemplateRam: next.discord_template_ram
         }
       });
     } catch (err) {
@@ -2503,6 +2625,7 @@ function App() {
 
   const openCrashReport = async (fileName: string) => {
     if (!isTauri) return;
+    setCrashModalOpen(true);
     setCrashLoading(true);
     try {
       const report = await invoke<CrashReport>("get_crash_report", { fileName });
@@ -3237,6 +3360,32 @@ function App() {
                   </PrimaryButton>
                 </div>
                 <p className="mt-3 text-xs text-muted">We will download and open the installer.</p>
+              </div>
+            </div>
+          )}
+          {discordModalOpen && (
+            <div className="fixed inset-0 z-60 flex items-start justify-center overflow-y-auto bg-black/60 px-6 py-8">
+              <div className="w-full max-w-2xl max-h-[calc(100vh-4rem)] overflow-y-auto rounded-3xl border border-white/10 bg-surface p-6 text-sm text-text shadow-soft">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.2em] text-muted">Integrations</p>
+                    <h3 className="mt-2 font-display text-xl text-text">Discord Webhook</h3>
+                  </div>
+                  <button
+                    className="rounded-full border border-white/10 px-3 py-1 text-xs text-muted transition hover:bg-white/10 hover:text-text"
+                    onClick={() => setDiscordModalOpen(false)}
+                  >
+                    Close
+                  </button>
+                </div>
+                <div className="mt-4">
+                  <DiscordSettings
+                    meta={serverMeta ?? DEFAULT_SERVER_META}
+                    serverName={selectedServer?.name ?? "Server"}
+                    onChange={saveServerMeta}
+                    onNotify={(tone, message) => setUiToast({ tone, message })}
+                  />
+                </div>
               </div>
             </div>
           )}
@@ -4610,6 +4759,21 @@ function App() {
                             )}
                           </div>
                         )}
+                      </div>
+                    </Card>
+                    <Card title="Integrations">
+                      <div className="grid gap-4">
+                        <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
+                          <p className="text-xs uppercase tracking-[0.2em] text-muted">Discord Webhook</p>
+                          <p className="mt-2 text-xs text-muted">
+                            Connect a Discord webhook to send server event updates.
+                          </p>
+                        </div>
+                        <div className="flex items-center justify-end">
+                          <SubtleButton onClick={() => setDiscordModalOpen(true)}>
+                            Setup
+                          </SubtleButton>
+                        </div>
                       </div>
                     </Card>
                       </motion.div>

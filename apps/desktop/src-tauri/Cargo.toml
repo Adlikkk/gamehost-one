@@ -1,6 +1,6 @@
 [package]
 name = "gamehostone"
-version = "0.3.1"
+version = "0.4.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -42,6 +42,12 @@ flate2 = "1"
 fastnbt = "2"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61.3", features = ["Win32_Graphics_Dwm", "Win32_Foundation"] }
+windows = { version = "0.61.3", features = [
+	"Win32_Foundation",
+	"Win32_Graphics_Dwm",
+	"Win32_Security",
+	"Win32_Security_Cryptography",
+	"Win32_System_Memory"
+] }
 raw-window-handle = "0.6"
 

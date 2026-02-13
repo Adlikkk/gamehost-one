@@ -200,6 +200,15 @@ export type ServerMeta = {
   auto_backup: boolean;
   backup_interval_minutes: number;
   last_backup_at?: string | null;
+  discord_webhook_url?: string | null;
+  discord_notify_start?: boolean;
+  discord_notify_stop?: boolean;
+  discord_notify_crash?: boolean;
+  discord_notify_ram?: boolean;
+  discord_template_start?: string;
+  discord_template_stop?: string;
+  discord_template_crash?: string;
+  discord_template_ram?: string;
 };
 
 export type ServerMetadata = {

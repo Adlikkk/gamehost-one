@@ -23,8 +23,8 @@ export function CrashModal({
   if (!open) return null;
 
   return (
-    <div className="fixed inset-0 z-60 flex items-center justify-center bg-black/60 px-6">
-      <div className="w-full max-w-4xl rounded-3xl border border-white/10 bg-surface p-6 text-sm text-text shadow-soft">
+    <div className="fixed inset-0 z-60 flex items-start justify-center overflow-y-auto bg-black/60 px-6 py-8">
+      <div className="w-full max-w-4xl max-h-[calc(100vh-4rem)] overflow-y-auto rounded-3xl border border-white/10 bg-surface p-6 text-sm text-text shadow-soft">
         <div className="flex items-start justify-between gap-4">
           <div>
             <p className="text-xs uppercase tracking-[0.2em] text-muted">Crash reports</p>
