@@ -10,7 +10,7 @@ function cx(...values: Array<string | false | null | undefined>) {
 export function BrandName({ className, accentClassName }: BrandNameProps) {
   return (
     <span className={cx("inline-flex items-center gap-1", className)}>
-      <span>Gamehost</span>
+      <span>GameHost</span>
       <span className={cx("text-one", accentClassName)}>ONE</span>
     </span>
   );

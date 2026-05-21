@@ -13,7 +13,7 @@ The only analytics events recorded are:
 
 Default: local JSON log at:
 
-AppData/GameHostOne/analytics.json
+`%APPDATA%\com.gamehost.one\analytics.json`
 
 No IP addresses are stored. No personal data is collected.
 

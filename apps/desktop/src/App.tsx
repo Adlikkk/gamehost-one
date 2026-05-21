@@ -68,6 +68,7 @@ import type {
   ServerMeta,
   ServerSettings,
   ServerStatus,
+  StorageInfo,
   UpdateInfo,
   VersionGroup,
   View,
@@ -189,6 +190,16 @@ const MAX_VERSION_OPTIONS_FORGE = 5;
 const BACKUP_INTERVALS = [30, 60, 360, 1440] as const;
 const UPDATE_REPO = "Adlikkk/gamehost-one-app";
 const UPDATE_SKIP_CRASH_KEY = "gho_skip_crash_modal_once";
+const DELETE_ALL_DATA_CONFIRMATION = "DELETE GAMEHOST ONE DATA";
+const SUPPORT_KOFI_URL = "https://ko-fi.com/L3L71NNOZV";
+
+function formatStorageSize(bytes: number | null | undefined) {
+  if (bytes == null) return "Unavailable";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
 
 type TutorialStep = {
   id: string;
@@ -212,7 +223,7 @@ const TUTORIAL_STEPS: TutorialStep[] = [
     view: "servers",
     selector: "[data-tutorial='create-server']",
     title: "Create a server",
-    body: "Start by creating a new Minecraft server for Gamehost ONE."
+    body: "Start by creating a new Minecraft server for GameHost ONE."
   },
   {
     id: "ram",
@@ -289,13 +300,15 @@ const container = {
 const item = { hidden: { opacity: 0, y: 16 }, show: { opacity: 1, y: 0 } };
 
 const getActionState = (status: ServerStatus) => {
+  const preparing = status === "PREPARING";
   const starting = status === "STARTING";
+  const stopping = status === "STOPPING";
   return {
     canStart: status === "STOPPED" || status === "ERROR",
-    canStop: status === "RUNNING",
+    canStop: status === "PREPARING" || status === "STARTING" || status === "RUNNING",
     canRestart: status === "RUNNING",
-    showStarting: starting,
-    statusLabel: starting ? "Starting server..." : null
+    showStarting: preparing || starting || stopping,
+    statusLabel: preparing ? "Preparing server..." : starting ? "Starting server..." : stopping ? "Stopping server..." : null
   };
 };
 
@@ -382,7 +395,7 @@ function CreateServerMenu({
 }
 
 const normalizeStatus = (value: string): ServerStatus => {
-  if (value === "STOPPED" || value === "STARTING" || value === "RUNNING" || value === "ERROR") {
+  if (value === "STOPPED" || value === "PREPARING" || value === "STARTING" || value === "RUNNING" || value === "STOPPING" || value === "ERROR") {
     return value;
   }
   return "STOPPED";
@@ -494,6 +507,10 @@ function App() {
   const [resource, setResource] = useState<ResourceUsage | null>(null);
   const [network, setNetwork] = useState<NetworkInfo | null>(null);
   const [appDataPath, setAppDataPath] = useState<string | null>(null);
+  const [storageInfo, setStorageInfo] = useState<StorageInfo | null>(null);
+  const [storageBusy, setStorageBusy] = useState(false);
+  const [deleteDataConfirmation, setDeleteDataConfirmation] = useState("");
+  const [deleteDataBusy, setDeleteDataBusy] = useState(false);
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
   const [appSettingsSaving, setAppSettingsSaving] = useState(false);
@@ -700,14 +717,24 @@ function App() {
   const deleteMatches = deleteTarget ? deleteConfirm.trim() === deleteTarget.name : false;
   const detailDeleteMatches = selectedServer ? deleteConfirm.trim() === selectedServer.name : false;
   const appDataDisplay = appDataPath ?? "C:\\Users\\Adam\\AppData\\Roaming\\com.gamehost.one";
+  useEffect(() => {
+    document.title = "GameHost ONE";
+    if (!isTauri) return;
+    void getCurrentWindow().setTitle("GameHost ONE").catch(() => undefined);
+  }, []);
+
   const effectiveAppSettings = appSettings ?? {
-    analytics_enabled: false,
-    crash_reporting_enabled: false,
-    analytics_endpoint: null,
-    launcher_path: null,
-    smart_join_panel_enabled: true,
-    notify_on_server_start: true,
-    mod_sync_mode: "ask"
+    analyticsEnabled: false,
+    crashReportingEnabled: false,
+    analyticsEndpoint: null,
+    launcherPath: null,
+    smartJoinPanelEnabled: true,
+    notifyServerStart: true,
+    notifyServerStop: true,
+    notifyServerCrash: true,
+    minimizeToTrayOnClose: true,
+    dismissedCloseToTrayHint: false,
+    modSyncMode: "ask"
   };
   const deferredWizardFilter = useDeferredValue(wizardVersionFilter);
   const deferredReinstallFilter = useDeferredValue(reinstallVersionFilter);
@@ -809,7 +836,7 @@ function App() {
         setStatus("STOPPED");
       }
 
-      await Promise.all([refreshNetwork(), loadAppSettings(), loadCrashReports(), handleCheckUpdates(true)]);
+      await Promise.all([refreshNetwork(), loadAppSettings(), loadStorageInfo(), loadCrashReports(), handleCheckUpdates(true)]);
     };
 
     init().finally(() => setView("library"));
@@ -843,10 +870,7 @@ function App() {
           });
         }
       }),
-      listen("server:start", () => setStatus("STARTING")),
-      listen("server:ready", () => setStatus("RUNNING")),
-      listen("server:error", () => setStatus("ERROR")),
-      listen("server:stopped", () => setStatus("STOPPED")),
+      listen<ServerStatus>("status_change", (event) => setStatus(normalizeStatus(String(event.payload)))),
       listen<{ server_id: string; progress: number }>("backup:progress", (event) => {
         setBackupProgress(event.payload.progress);
       }),
@@ -1182,20 +1206,24 @@ function App() {
 
     if (status === "RUNNING" && prev !== "RUNNING") {
       setUiToast({ tone: "success", message: "Your server is up and running!" });
-      if (effectiveAppSettings.notify_on_server_start !== false) {
-        notify("Server is running", `${serverName} is now online.`);
+      if (effectiveAppSettings.notifyServerStart !== false) {
+        notify("GameHost ONE", `${serverName} is now online.`);
       }
       emitEvent("server:start", webhookPayload);
       setSmartJoinDismissed(false);
     }
     if (status === "ERROR" && prev !== "ERROR") {
       setUiToast({ tone: "error", message: "Server failed to start. Check logs." });
-      notify("Gamehost ONE", "Server failed to start. Check logs.");
+      if (effectiveAppSettings.notifyServerCrash !== false) {
+        notify("GameHost ONE", "Server failed to start. Check logs.");
+      }
       emitEvent("server:crash", webhookPayload);
     }
     if (status === "STOPPED" && prev !== "STOPPED") {
       setUiToast({ tone: "success", message: "Server stopped." });
-      notify("Gamehost ONE", "Server stopped.");
+      if (effectiveAppSettings.notifyServerStop !== false) {
+        notify("GameHost ONE", "Server stopped.");
+      }
       emitEvent("server:stop", webhookPayload);
       setActivePlayers(0);
       setOnlinePlayers([]);
@@ -1209,8 +1237,21 @@ function App() {
     selectedServer,
     activeServerConfig,
     network,
-    effectiveAppSettings.notify_on_server_start
+    effectiveAppSettings.notifyServerStart,
+    effectiveAppSettings.notifyServerStop,
+    effectiveAppSettings.notifyServerCrash
   ]);
+
+  useEffect(() => {
+    if (view !== "settings") return;
+    if (!effectiveAppSettings.minimizeToTrayOnClose) return;
+    if (effectiveAppSettings.dismissedCloseToTrayHint) return;
+    setUiToast({
+      tone: "success",
+      message: "Closing the window keeps GameHost ONE running in the tray. You can turn this off in Settings.",
+      label: "Tray"
+    });
+  }, [view, effectiveAppSettings.minimizeToTrayOnClose, effectiveAppSettings.dismissedCloseToTrayHint]);
 
   useEffect(() => {
     if (!selectedServer || !serverMeta) return;
@@ -1545,7 +1586,7 @@ function App() {
       await loadMotd(created);
       await loadBackups(created);
       await loadServerMeta(created);
-      const defaultMotd = "Gamehost ONE server";
+      const defaultMotd = "GameHost ONE server";
       setMotdDraft(defaultMotd);
       await saveMotd(defaultMotd, created);
       if (worldImportPayload) {
@@ -1586,7 +1627,7 @@ function App() {
     await loadMotd(created);
     await loadBackups(created);
     await loadServerMeta(created);
-    const defaultMotd = "Gamehost ONE server";
+    const defaultMotd = "GameHost ONE server";
     setMotdDraft(defaultMotd);
     await saveMotd(defaultMotd, created);
   };
@@ -1700,7 +1741,7 @@ function App() {
     }
 
     const modsEnabled = selectedServer.server_type === "forge" || selectedServer.server_type === "fabric";
-    const rawSyncMode = effectiveAppSettings.mod_sync_mode ?? "ask";
+    const rawSyncMode = effectiveAppSettings.modSyncMode ?? "ask";
     const syncMode = rawSyncMode === "copy" ? "metadata" : rawSyncMode;
     if (modsEnabled) {
       if (syncMode === "ask") {
@@ -1714,7 +1755,7 @@ function App() {
         if (syncMode === "metadata") {
           await syncModsWithMetadata(selectedServer);
           if (rawSyncMode === "copy") {
-            await saveAppSettings({ ...effectiveAppSettings, mod_sync_mode: "metadata" });
+            await saveAppSettings({ ...effectiveAppSettings, modSyncMode: "metadata" });
           }
         }
       } catch (err) {
@@ -1742,7 +1783,7 @@ function App() {
     if (!selection || Array.isArray(selection)) return;
     await saveAppSettings({
       ...effectiveAppSettings,
-      launcher_path: selection
+      launcherPath: selection
     });
   };
 
@@ -1750,7 +1791,7 @@ function App() {
     if (!isTauri) return;
     await saveAppSettings({
       ...effectiveAppSettings,
-      launcher_path: null
+      launcherPath: null
     });
   };
 
@@ -2144,6 +2185,10 @@ function App() {
 
   const handleRestoreBackup = async (entry: BackupEntry) => {
     if (!selectedServer || !isTauri) return;
+    if (status !== "STOPPED") {
+      setUiToast({ tone: "error", message: "Stop the server before restoring a backup." });
+      return;
+    }
     let ok = false;
     try {
       ok = await confirm("Restore this backup? Current world will be replaced.", {
@@ -2501,7 +2546,17 @@ function App() {
   );
 
   const openAppData = async () => {
-    const targetPath = appDataPath ?? "C:\\Users\\Adam\\AppData\\Roaming\\com.gamehost.one";
+    const targetPath = storageInfo?.app_data_dir ?? appDataPath ?? "C:\\Users\\Adam\\AppData\\Roaming\\com.gamehost.one";
+    try {
+      await openPath(targetPath);
+    } catch (err) {
+      setUiToast({ tone: "error", message: String(err) });
+    }
+  };
+
+  const openLogsFolder = async () => {
+    const targetPath = storageInfo?.logs_dir;
+    if (!targetPath) return;
     try {
       await openPath(targetPath);
     } catch (err) {
@@ -2519,6 +2574,17 @@ function App() {
     }
   };
 
+  const loadStorageInfo = async () => {
+    if (!isTauri) return;
+    try {
+      const info = await invoke<StorageInfo>("get_storage_info");
+      setStorageInfo(info);
+      setAppDataPath(info.app_data_dir);
+    } catch (err) {
+      setUiToast({ tone: "error", message: String(err) });
+    }
+  };
+
   const saveAppSettings = async (next: AppSettings) => {
     if (!isTauri) return;
     setAppSettingsSaving(true);
@@ -2530,6 +2596,34 @@ function App() {
       setUiToast({ tone: "error", message: String(err) });
     } finally {
       setAppSettingsSaving(false);
+    }
+  };
+
+  const runStorageAction = async (
+    action: "clear_app_logs" | "clear_java_runtimes" | "clear_temp_files",
+    successMessage: string
+  ) => {
+    if (!isTauri) return;
+    setStorageBusy(true);
+    try {
+      await invoke(action);
+      await loadStorageInfo();
+      setUiToast({ tone: "success", message: successMessage });
+    } catch (err) {
+      setUiToast({ tone: "error", message: String(err) });
+    } finally {
+      setStorageBusy(false);
+    }
+  };
+
+  const handleDeleteAllAppData = async () => {
+    if (!isTauri || deleteDataConfirmation !== DELETE_ALL_DATA_CONFIRMATION) return;
+    setDeleteDataBusy(true);
+    try {
+      await invoke("delete_all_app_data_and_exit");
+    } catch (err) {
+      setUiToast({ tone: "error", message: String(err) });
+      setDeleteDataBusy(false);
     }
   };
 
@@ -2562,7 +2656,10 @@ function App() {
     setUpdateError(null);
     try {
       window.localStorage.setItem(UPDATE_SKIP_CRASH_KEY, "true");
-      await invoke("install_update", { downloadUrl: updateInfo.download_url });
+      await invoke("install_update", {
+        downloadUrl: updateInfo.download_url,
+        checksumUrl: updateInfo.checksum_url
+      });
       setUpdateModalOpen(false);
     } catch (err) {
       const message = String(err);
@@ -2683,9 +2780,9 @@ function App() {
         .find((line) => line.startsWith("motd="))
         ?.replace("motd=", "");
       const cleaned = motdLine?.replace(/§bONE§r/g, "ONE");
-      setMotdDraft(String(cleaned ?? "Gamehost ONE server"));
+      setMotdDraft(String(cleaned ?? "GameHost ONE server"));
     } catch {
-      setMotdDraft("Gamehost ONE server");
+      setMotdDraft("GameHost ONE server");
     }
   };
 
@@ -2798,7 +2895,7 @@ function App() {
       >
         <TitleBar uiToast={uiToast} onMinimize={handleMinimize} onMaximize={handleMaximize} onClose={handleClose} />
 
-        {serverReady && effectiveAppSettings.smart_join_panel_enabled && !smartJoinDismissed && (
+        {serverReady && effectiveAppSettings.smartJoinPanelEnabled && !smartJoinDismissed && (
           <motion.div
             variants={item}
             className="fixed bottom-6 right-6 z-40 w-full max-w-xs rounded-3xl border border-white/10 bg-surface/95 p-4 text-sm text-text shadow-soft"
@@ -2978,7 +3075,7 @@ function App() {
             open={launcherChoiceOpen}
             onClose={() => setLauncherChoiceOpen(false)}
             onChoose={handleChooseLauncher}
-            launcherPath={effectiveAppSettings.launcher_path ?? null}
+            launcherPath={effectiveAppSettings.launcherPath ?? null}
             onPickLauncherPath={handlePickLauncherPath}
             onClearLauncherPath={handleClearLauncherPath}
           />
@@ -3198,7 +3295,7 @@ function App() {
                       try {
                         await syncModsWithMetadata(selectedServer);
                         if (modSyncChoiceRemember) {
-                          await saveAppSettings({ ...effectiveAppSettings, mod_sync_mode: "metadata" });
+                          await saveAppSettings({ ...effectiveAppSettings, modSyncMode: "metadata" });
                         }
                         setModSyncChoiceBusy(false);
                         setModSyncChoiceOpen(false);
@@ -3225,7 +3322,7 @@ function App() {
                         setPendingLaunchAfterSync(false);
                       }
                       if (modSyncChoiceRemember) {
-                        await saveAppSettings({ ...effectiveAppSettings, mod_sync_mode: "ask" });
+                        await saveAppSettings({ ...effectiveAppSettings, modSyncMode: "ask" });
                       }
                     }}
                     disabled={modSyncChoiceBusy}
@@ -3375,7 +3472,7 @@ function App() {
               transition={{ duration: 0.35 }}
             >
               <div className="h-52 w-52">
-                <img src="/logo.png" alt="Gamehost ONE" className="h-full w-full rounded-2xl" />
+                <img src="/logo.png" alt="GameHost ONE" className="h-full w-full rounded-2xl" />
               </div>
               <BrandName className="text-3xl font-semibold text-text" />
               <div className="w-full max-w-4xl">
@@ -3411,7 +3508,7 @@ function App() {
               <motion.header variants={item} className="flex flex-wrap items-center justify-between gap-4">
                 <div className="flex items-center gap-4">
                   <div className="h-24 w-24 rounded-3xl">
-                    <img src="/logo.png" alt="Gamehost ONE" className="h-full w-full rounded-2xl" />
+                    <img src="/logo.png" alt="GameHost ONE" className="h-full w-full rounded-2xl" />
                   </div>
                   <div>
                     <BrandName className="text-xs uppercase tracking-[0.3em] text-muted" />
@@ -3531,15 +3628,15 @@ function App() {
                         <span
                           className={classNames(
                             "rounded-full px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.2em]",
-                            effectiveAppSettings.analytics_enabled ? "bg-secondary/20 text-secondary" : "bg-white/10 text-muted"
+                            effectiveAppSettings.analyticsEnabled ? "bg-secondary/20 text-secondary" : "bg-white/10 text-muted"
                           )}
                         >
-                          {effectiveAppSettings.analytics_enabled ? "On" : "Off"}
+                          {effectiveAppSettings.analyticsEnabled ? "On" : "Off"}
                         </span>
                         <Switch.Root
-                          checked={effectiveAppSettings.analytics_enabled}
+                          checked={effectiveAppSettings.analyticsEnabled}
                           onCheckedChange={(value) =>
-                            saveAppSettings({ ...effectiveAppSettings, analytics_enabled: value })
+                            saveAppSettings({ ...effectiveAppSettings, analyticsEnabled: value })
                           }
                           className="relative h-6 w-11 rounded-full bg-white/15 transition data-[state=checked]:bg-secondary"
                           disabled={appSettingsSaving}
@@ -3554,15 +3651,15 @@ function App() {
                         <span
                           className={classNames(
                             "rounded-full px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.2em]",
-                            effectiveAppSettings.crash_reporting_enabled ? "bg-secondary/20 text-secondary" : "bg-white/10 text-muted"
+                            effectiveAppSettings.crashReportingEnabled ? "bg-secondary/20 text-secondary" : "bg-white/10 text-muted"
                           )}
                         >
-                          {effectiveAppSettings.crash_reporting_enabled ? "On" : "Off"}
+                          {effectiveAppSettings.crashReportingEnabled ? "On" : "Off"}
                         </span>
                         <Switch.Root
-                          checked={effectiveAppSettings.crash_reporting_enabled}
+                          checked={effectiveAppSettings.crashReportingEnabled}
                           onCheckedChange={(value) =>
-                            saveAppSettings({ ...effectiveAppSettings, crash_reporting_enabled: value })
+                            saveAppSettings({ ...effectiveAppSettings, crashReportingEnabled: value })
                           }
                           className="relative h-6 w-11 rounded-full bg-white/15 transition data-[state=checked]:bg-secondary"
                           disabled={appSettingsSaving}
@@ -3582,17 +3679,17 @@ function App() {
                         <span
                           className={classNames(
                             "rounded-full px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.2em]",
-                            effectiveAppSettings.smart_join_panel_enabled
+                            effectiveAppSettings.smartJoinPanelEnabled
                               ? "bg-secondary/20 text-secondary"
                               : "bg-white/10 text-muted"
                           )}
                         >
-                          {effectiveAppSettings.smart_join_panel_enabled ? "On" : "Off"}
+                          {effectiveAppSettings.smartJoinPanelEnabled ? "On" : "Off"}
                         </span>
                         <Switch.Root
-                          checked={Boolean(effectiveAppSettings.smart_join_panel_enabled)}
+                          checked={Boolean(effectiveAppSettings.smartJoinPanelEnabled)}
                           onCheckedChange={(value) =>
-                            saveAppSettings({ ...effectiveAppSettings, smart_join_panel_enabled: value })
+                            saveAppSettings({ ...effectiveAppSettings, smartJoinPanelEnabled: value })
                           }
                           className="relative h-6 w-11 rounded-full bg-white/15 transition data-[state=checked]:bg-secondary"
                           disabled={appSettingsSaving}
@@ -3601,23 +3698,23 @@ function App() {
                         </Switch.Root>
                       </SettingRow>
                       <SettingRow
-                        label="Windows start notification"
+                        label="Server start notification"
                         description="Show a native Windows notification when the server starts."
                       >
                         <span
                           className={classNames(
                             "rounded-full px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.2em]",
-                            effectiveAppSettings.notify_on_server_start
+                            effectiveAppSettings.notifyServerStart
                               ? "bg-secondary/20 text-secondary"
                               : "bg-white/10 text-muted"
                           )}
                         >
-                          {effectiveAppSettings.notify_on_server_start ? "On" : "Off"}
+                          {effectiveAppSettings.notifyServerStart ? "On" : "Off"}
                         </span>
                         <Switch.Root
-                          checked={Boolean(effectiveAppSettings.notify_on_server_start)}
+                          checked={Boolean(effectiveAppSettings.notifyServerStart)}
                           onCheckedChange={(value) =>
-                            saveAppSettings({ ...effectiveAppSettings, notify_on_server_start: value })
+                            saveAppSettings({ ...effectiveAppSettings, notifyServerStart: value })
                           }
                           className="relative h-6 w-11 rounded-full bg-white/15 transition data-[state=checked]:bg-secondary"
                           disabled={appSettingsSaving}
@@ -3625,6 +3722,96 @@ function App() {
                           <Switch.Thumb className="block h-5 w-5 translate-x-0.5 rounded-full bg-white transition data-[state=checked]:translate-x-5" />
                         </Switch.Root>
                       </SettingRow>
+                      <SettingRow
+                        label="Server stop notification"
+                        description="Show a native Windows notification when the server stops."
+                      >
+                        <span
+                          className={classNames(
+                            "rounded-full px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.2em]",
+                            effectiveAppSettings.notifyServerStop
+                              ? "bg-secondary/20 text-secondary"
+                              : "bg-white/10 text-muted"
+                          )}
+                        >
+                          {effectiveAppSettings.notifyServerStop ? "On" : "Off"}
+                        </span>
+                        <Switch.Root
+                          checked={Boolean(effectiveAppSettings.notifyServerStop)}
+                          onCheckedChange={(value) =>
+                            saveAppSettings({ ...effectiveAppSettings, notifyServerStop: value })
+                          }
+                          className="relative h-6 w-11 rounded-full bg-white/15 transition data-[state=checked]:bg-secondary"
+                          disabled={appSettingsSaving}
+                        >
+                          <Switch.Thumb className="block h-5 w-5 translate-x-0.5 rounded-full bg-white transition data-[state=checked]:translate-x-5" />
+                        </Switch.Root>
+                      </SettingRow>
+                      <SettingRow
+                        label="Server crash notification"
+                        description="Show a native Windows notification when the server crashes or fails to start."
+                      >
+                        <span
+                          className={classNames(
+                            "rounded-full px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.2em]",
+                            effectiveAppSettings.notifyServerCrash
+                              ? "bg-secondary/20 text-secondary"
+                              : "bg-white/10 text-muted"
+                          )}
+                        >
+                          {effectiveAppSettings.notifyServerCrash ? "On" : "Off"}
+                        </span>
+                        <Switch.Root
+                          checked={Boolean(effectiveAppSettings.notifyServerCrash)}
+                          onCheckedChange={(value) =>
+                            saveAppSettings({ ...effectiveAppSettings, notifyServerCrash: value })
+                          }
+                          className="relative h-6 w-11 rounded-full bg-white/15 transition data-[state=checked]:bg-secondary"
+                          disabled={appSettingsSaving}
+                        >
+                          <Switch.Thumb className="block h-5 w-5 translate-x-0.5 rounded-full bg-white transition data-[state=checked]:translate-x-5" />
+                        </Switch.Root>
+                      </SettingRow>
+                      <SettingRow
+                        label="Minimize to tray on close"
+                        description="Keep GameHost ONE running in the tray when the window is closed."
+                      >
+                        <span
+                          className={classNames(
+                            "rounded-full px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.2em]",
+                            effectiveAppSettings.minimizeToTrayOnClose
+                              ? "bg-secondary/20 text-secondary"
+                              : "bg-white/10 text-muted"
+                          )}
+                        >
+                          {effectiveAppSettings.minimizeToTrayOnClose ? "On" : "Off"}
+                        </span>
+                        <Switch.Root
+                          checked={Boolean(effectiveAppSettings.minimizeToTrayOnClose)}
+                          onCheckedChange={(value) =>
+                            saveAppSettings({ ...effectiveAppSettings, minimizeToTrayOnClose: value })
+                          }
+                          className="relative h-6 w-11 rounded-full bg-white/15 transition data-[state=checked]:bg-secondary"
+                          disabled={appSettingsSaving}
+                        >
+                          <Switch.Thumb className="block h-5 w-5 translate-x-0.5 rounded-full bg-white transition data-[state=checked]:translate-x-5" />
+                        </Switch.Root>
+                      </SettingRow>
+                      {effectiveAppSettings.minimizeToTrayOnClose && !effectiveAppSettings.dismissedCloseToTrayHint && (
+                        <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-xs text-muted">
+                          Closing the window hides GameHost ONE to the tray. Double-click the tray icon to focus it again.
+                          <div className="mt-3">
+                            <SubtleButton
+                              onClick={() =>
+                                saveAppSettings({ ...effectiveAppSettings, dismissedCloseToTrayHint: true })
+                              }
+                              disabled={appSettingsSaving}
+                            >
+                              Dismiss hint
+                            </SubtleButton>
+                          </div>
+                        </div>
+                      )}
                       <SettingRow
                         label="Mod sync on launch"
                         description="Choose how to sync server mods when launching Minecraft."
@@ -3637,12 +3824,12 @@ function App() {
                             <SubtleButton
                               key={option.value}
                               className={classNames(
-                                effectiveAppSettings.mod_sync_mode === option.value
+                                effectiveAppSettings.modSyncMode === option.value
                                   ? "bg-one/20 text-one ring-1 ring-one/40"
                                   : ""
                               )}
                               onClick={() =>
-                                saveAppSettings({ ...effectiveAppSettings, mod_sync_mode: option.value })
+                                saveAppSettings({ ...effectiveAppSettings, modSyncMode: option.value })
                               }
                               disabled={appSettingsSaving}
                             >
@@ -3657,6 +3844,98 @@ function App() {
                 </div>
 
                 <div className="grid gap-6">
+                  <Card title="Storage">
+                    <div className="grid gap-4">
+                      <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
+                        <p className="text-xs uppercase tracking-[0.2em] text-muted">App data folder</p>
+                        <p className="mt-1 break-all text-xs text-text">{storageInfo?.app_data_dir ?? appDataDisplay}</p>
+                      </div>
+                      <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
+                        <p className="text-xs uppercase tracking-[0.2em] text-muted">Server storage folder</p>
+                        <p className="mt-1 break-all text-xs text-text">{storageInfo?.server_storage_dir ?? "Unavailable"}</p>
+                      </div>
+                      <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
+                        <p className="text-xs uppercase tracking-[0.2em] text-muted">Logs folder</p>
+                        <p className="mt-1 break-all text-xs text-text">{storageInfo?.logs_dir ?? "Unavailable"}</p>
+                      </div>
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
+                          <p className="text-xs uppercase tracking-[0.2em] text-muted">Runtime cache</p>
+                          <p className="mt-1 text-sm text-text">{formatStorageSize(storageInfo?.runtime_size_bytes)}</p>
+                          <p className="mt-1 break-all text-[11px] text-muted">{storageInfo?.runtime_dir ?? "Unavailable"}</p>
+                        </div>
+                        <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3">
+                          <p className="text-xs uppercase tracking-[0.2em] text-muted">Backups</p>
+                          <p className="mt-1 text-sm text-text">{formatStorageSize(storageInfo?.backups_size_bytes)}</p>
+                          <p className="mt-1 break-all text-[11px] text-muted">{storageInfo?.backups_dir ?? "Unavailable"}</p>
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <SubtleButton onClick={openAppData}>Open app data</SubtleButton>
+                        <SubtleButton onClick={openLogsFolder} disabled={!storageInfo?.logs_dir}>
+                          Open logs
+                        </SubtleButton>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <SubtleButton
+                          onClick={() => runStorageAction("clear_app_logs", "Logs cleared.")}
+                          disabled={storageBusy || deleteDataBusy}
+                        >
+                          Clear logs
+                        </SubtleButton>
+                        <SubtleButton
+                          onClick={() => runStorageAction("clear_java_runtimes", "Downloaded Java runtimes cleared.")}
+                          disabled={storageBusy || deleteDataBusy}
+                        >
+                          Clear downloaded Java runtimes
+                        </SubtleButton>
+                        <SubtleButton
+                          onClick={() => runStorageAction("clear_temp_files", "Temporary files cleared.")}
+                          disabled={storageBusy || deleteDataBusy}
+                        >
+                          Clear temporary files
+                        </SubtleButton>
+                      </div>
+                      <div className="rounded-3xl border border-danger/40 bg-danger/10 p-4">
+                        <p className="text-xs uppercase tracking-[0.2em] text-danger">Danger Zone</p>
+                        <h3 className="mt-2 text-base font-semibold text-text">Delete all GameHost ONE data</h3>
+                        <p className="mt-2 text-sm text-muted">
+                          This deletes settings, logs, cached runtimes, crash reports, locally managed servers, and
+                          backups stored by GameHost ONE.
+                        </p>
+                        <p className="mt-2 text-sm text-muted">
+                          Linked external server folders outside GameHost ONE storage will NOT be deleted.
+                        </p>
+                        <div className="mt-4 rounded-2xl border border-white/10 bg-black/20 px-4 py-3">
+                          <p className="text-xs uppercase tracking-[0.2em] text-muted">Type to confirm</p>
+                          <p className="mt-2 text-xs text-text">{DELETE_ALL_DATA_CONFIRMATION}</p>
+                          <input
+                            value={deleteDataConfirmation}
+                            onChange={(event) => setDeleteDataConfirmation(event.target.value)}
+                            placeholder={DELETE_ALL_DATA_CONFIRMATION}
+                            className="mt-3 w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-text outline-none transition focus:border-danger/60"
+                            disabled={deleteDataBusy}
+                          />
+                        </div>
+                        <div className="mt-4 flex flex-wrap items-center gap-2">
+                          <PrimaryButton
+                            onClick={handleDeleteAllAppData}
+                            disabled={deleteDataBusy || deleteDataConfirmation !== DELETE_ALL_DATA_CONFIRMATION}
+                            className="bg-danger text-white hover:bg-danger/90 disabled:hover:bg-danger"
+                          >
+                            {deleteDataBusy ? "Deleting and closing..." : "Delete all app data"}
+                          </PrimaryButton>
+                          <SubtleButton
+                            onClick={() => setDeleteDataConfirmation("")}
+                            disabled={deleteDataBusy || deleteDataConfirmation.length === 0}
+                          >
+                            Clear typed confirmation
+                          </SubtleButton>
+                        </div>
+                      </div>
+                    </div>
+                  </Card>
+
                   <Card title="About">
                     <div className="grid gap-2">
                       <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-2">
@@ -3676,12 +3955,23 @@ function App() {
                         </div>
                       </div>
                       <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-2">
+                        <p className="text-xs uppercase tracking-[0.2em] text-muted">Support development</p>
+                        <p className="mt-1 text-xs text-muted">
+                          GameHost ONE is built as a local-first tool. If it helps you, you can support development.
+                        </p>
+                        <div className="mt-2 flex items-center gap-2">
+                          <SubtleButton onClick={() => openUrl(SUPPORT_KOFI_URL)}>
+                            Support on Ko-fi
+                          </SubtleButton>
+                        </div>
+                      </div>
+                      <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-2">
                         <p className="text-xs uppercase tracking-[0.2em] text-muted">Web</p>
                         <div className="mt-2 flex items-center justify-between gap-4">
                           <div className="flex items-center gap-2">
-                            <img src="/logo.png" alt="Gamehost ONE" className="h-5 w-5 rounded-md" />
+                            <img src="/logo.png" alt="GameHost ONE" className="h-5 w-5 rounded-md" />
                             <p className="text-sm font-semibold text-text">
-                              Gamehost <span className="text-teal-300">ONE</span>
+                              GameHost <span className="text-teal-300">ONE</span>
                             </p>
                           </div>
                           <SubtleButton onClick={() => openUrl("https://gamehost-one-web.pages.dev/")}
@@ -4478,7 +4768,7 @@ function App() {
                                 className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-text transition focus:border-one/60 focus:outline-none"
                                 value={motdDraft}
                                 onChange={(event) => setMotdDraft(event.target.value)}
-                                placeholder="Gamehost ONE"
+                                placeholder="GameHost ONE"
                               />
                               <p className="text-xs text-muted">Keep it short so it fits nicely in the server list.</p>
                             </div>

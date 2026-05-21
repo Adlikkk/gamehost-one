@@ -1,13 +1,15 @@
 {
   "name": "gamehostone",
   "private": true,
-  "version": "0.5.0",
+  "version": "0.5.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "node scripts/tauri.mjs",
+    "tauri:build": "node scripts/tauri.mjs build",
+    "tauri:build:msi": "node scripts/tauri.mjs build --bundles msi"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.15",

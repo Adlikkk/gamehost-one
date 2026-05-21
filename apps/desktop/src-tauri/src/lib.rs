@@ -1,4 +1,4 @@
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use fastnbt::from_bytes;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Map, Value, json};
 use base64::{engine::general_purpose, Engine as _};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
@@ -54,8 +54,10 @@ enum ServerType {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum ServerStatus {
     STOPPED,
+    PREPARING,
     STARTING,
     RUNNING,
+    STOPPING,
     ERROR,
 }
 
@@ -251,16 +253,45 @@ struct JavaConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct AppSettings {
+    #[serde(alias = "analytics_enabled")]
     analytics_enabled: bool,
+    #[serde(alias = "crash_reporting_enabled")]
     crash_reporting_enabled: bool,
+    #[serde(alias = "analytics_endpoint")]
     analytics_endpoint: Option<String>,
+    #[serde(alias = "launcher_path")]
     launcher_path: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "smart_join_panel_enabled")]
     smart_join_panel_enabled: bool,
-    #[serde(default = "default_notify_on_server_start")]
+    #[serde(
+        rename = "notifyServerStart",
+        default = "default_notify_on_server_start",
+        alias = "notify_on_server_start"
+    )]
     notify_on_server_start: bool,
-    #[serde(default = "default_mod_sync_mode")]
+    #[serde(
+        rename = "notifyServerStop",
+        default = "default_notify_on_server_stop",
+        alias = "notify_on_server_stop"
+    )]
+    notify_on_server_stop: bool,
+    #[serde(
+        rename = "notifyServerCrash",
+        default = "default_notify_on_server_error",
+        alias = "notify_on_server_error",
+        alias = "notify_on_server_crash"
+    )]
+    notify_on_server_error: bool,
+    #[serde(
+        default = "default_minimize_to_tray_on_close",
+        alias = "minimize_to_tray_on_close"
+    )]
+    minimize_to_tray_on_close: bool,
+    #[serde(default, alias = "dismissed_close_to_tray_hint")]
+    dismissed_close_to_tray_hint: bool,
+    #[serde(default = "default_mod_sync_mode", alias = "mod_sync_mode")]
     mod_sync_mode: String,
 }
 
@@ -276,6 +307,18 @@ fn default_notify_on_server_start() -> bool {
     true
 }
 
+fn default_notify_on_server_stop() -> bool {
+    true
+}
+
+fn default_notify_on_server_error() -> bool {
+    true
+}
+
+fn default_minimize_to_tray_on_close() -> bool {
+    true
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -285,6 +328,10 @@ impl Default for AppSettings {
             launcher_path: None,
             smart_join_panel_enabled: true,
             notify_on_server_start: default_notify_on_server_start(),
+            notify_on_server_stop: default_notify_on_server_stop(),
+            notify_on_server_error: default_notify_on_server_error(),
+            minimize_to_tray_on_close: default_minimize_to_tray_on_close(),
+            dismissed_close_to_tray_hint: false,
             mod_sync_mode: default_mod_sync_mode(),
         }
     }
@@ -295,6 +342,7 @@ struct UpdateInfo {
     update_available: bool,
     latest_version: Option<String>,
     download_url: Option<String>,
+    checksum_url: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -372,6 +420,18 @@ struct ResourceUsage {
     cpu_percent: f32,
     memory_mb: f32,
     memory_limit_mb: f32,
+}
+
+#[derive(Debug, Serialize)]
+struct StorageInfo {
+    app_data_dir: String,
+    server_storage_dir: String,
+    logs_dir: String,
+    runtime_dir: String,
+    backups_dir: String,
+    temp_dir: String,
+    runtime_size_bytes: u64,
+    backups_size_bytes: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -552,7 +612,10 @@ impl ProcessManager {
         process: Arc<Mutex<ProcessManager>>,
         java_exe: &Path,
     ) -> Result<(), String> {
-        if matches!(self.status, ServerStatus::RUNNING | ServerStatus::STARTING) {
+        if matches!(
+            self.status,
+            ServerStatus::PREPARING | ServerStatus::STARTING | ServerStatus::RUNNING | ServerStatus::STOPPING
+        ) {
             return Ok(());
         }
 
@@ -595,16 +658,12 @@ impl ProcessManager {
             }
         }
 
-        self.status = ServerStatus::STARTING;
-        self.started_at = Some(Instant::now());
-        self.active_server_id = Some(config.name.clone());
-        emit_status(app, self.status);
-        emit_server_event(app, "server:start");
-
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(err) => {
                 self.status = ServerStatus::ERROR;
+                self.started_at = None;
+                self.active_server_id = None;
                 emit_status(app, self.status);
                 emit_server_event(app, "server:error");
                 if err.kind() == ErrorKind::NotFound {
@@ -626,6 +685,10 @@ impl ProcessManager {
         self.pid = Some(child.id());
         self.stdin = stdin;
         self.child = Some(child);
+        self.status = ServerStatus::STARTING;
+        self.started_at = Some(Instant::now());
+        self.active_server_id = Some(config.name.clone());
+        emit_status(app, self.status);
         spawn_output_thread(app.clone(), process.clone(), stdout, "stdout");
         spawn_output_thread(app.clone(), process, stderr, "stderr");
 
@@ -634,12 +697,18 @@ impl ProcessManager {
 
     fn stop(&mut self, app: &AppHandle) -> Result<(), String> {
         if self.child.is_none() {
+            self.status = ServerStatus::STOPPING;
+            emit_status(app, self.status);
             self.status = ServerStatus::STOPPED;
+            self.started_at = None;
             self.active_server_id = None;
             emit_status(app, self.status);
+            emit_server_event(app, "server:stopped");
             return Ok(());
         }
 
+        self.status = ServerStatus::STOPPING;
+        emit_status(app, self.status);
         if let Some(stdin) = self.stdin.as_mut() {
             let _ = writeln!(stdin, "stop");
         }
@@ -777,24 +846,66 @@ fn get_active_server_id(state: State<AppState>) -> Result<Option<String>, String
 fn start_server(server_id: String, state: State<AppState>, app: AppHandle) -> Result<(), String> {
     let registry = load_registry(&state.registry_path, &state.legacy_config_path)?;
     let config = get_server_by_id(&registry, &server_id).ok_or("Server not found")?;
-    let server_dir = PathBuf::from(&config.server_dir);
-    let settings = load_settings(&server_dir)?;
-    apply_settings_to_properties(&server_dir, &settings)?;
     let process = state.process.clone();
-    let mut manager = process
-        .lock()
-        .map_err(|_| "Failed to lock process state")?;
-    if manager
-        .active_server_id
-        .as_deref()
-        .is_some_and(|active| active != server_id)
     {
-        return Err("Another server is currently running".to_string());
+        let mut manager = process
+            .lock()
+            .map_err(|_| "Failed to lock process state")?;
+        if manager
+            .active_server_id
+            .as_deref()
+            .is_some_and(|active| active != server_id)
+        {
+            return Err("Another server is currently running".to_string());
+        }
+        if !matches!(manager.status, ServerStatus::STOPPED | ServerStatus::ERROR) {
+            return Err("Server is already starting or running".to_string());
+        }
+        manager.status = ServerStatus::PREPARING;
+        manager.started_at = None;
+        manager.active_server_id = Some(config.name.clone());
+        emit_status(&app, manager.status);
     }
-    let java_exe = java_executable_for_version(&config.version, &state.data_dir)?;
-    manager.start(&app, &config, process.clone(), &java_exe)?;
-    drop(manager);
-    spawn_exit_watcher(process, app.clone());
+
+    let result = (|| -> Result<(), String> {
+        let server_dir = PathBuf::from(&config.server_dir);
+        let settings = load_settings(&server_dir)?;
+        apply_settings_to_properties(&server_dir, &settings)?;
+        let java_exe = java_executable_for_version(&config.version, &state.data_dir)?;
+        let mut manager = process
+            .lock()
+            .map_err(|_| "Failed to lock process state")?;
+        if !matches!(manager.status, ServerStatus::PREPARING)
+            || manager.active_server_id.as_deref() != Some(server_id.as_str())
+        {
+            return Err("Server start was canceled.".to_string());
+        }
+        manager.start(&app, &config, process.clone(), &java_exe)?;
+        drop(manager);
+        spawn_exit_watcher(process.clone(), app.clone());
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        if let Ok(mut manager) = process.lock() {
+            manager.child = None;
+            manager.stdin = None;
+            manager.pid = None;
+            manager.started_at = None;
+            manager.active_server_id = None;
+            manager.status = if err == "Server start was canceled." {
+                ServerStatus::STOPPED
+            } else {
+                ServerStatus::ERROR
+            };
+            emit_status(&app, manager.status);
+        }
+        if err != "Server start was canceled." {
+            emit_server_event(&app, "server:error");
+        }
+        return Err(err);
+    }
+
     Ok(())
 }
 
@@ -851,7 +962,7 @@ fn send_console_command(server_id: String, command: String, state: State<AppStat
 
 #[tauri::command]
 fn get_status(server_id: String, state: State<AppState>) -> Result<ServerStatus, String> {
-    let mut manager = state
+    let manager = state
         .process
         .lock()
         .map_err(|_| "Failed to lock process state")?;
@@ -861,22 +972,6 @@ fn get_status(server_id: String, state: State<AppState>) -> Result<ServerStatus,
         .is_some_and(|active| active != server_id)
     {
         return Ok(ServerStatus::STOPPED);
-    }
-    if let Some(pid) = manager.pid() {
-        let mut system = System::new_all();
-        system.refresh_process(Pid::from_u32(pid));
-        if system.process(Pid::from_u32(pid)).is_some() {
-            if matches!(manager.status(), ServerStatus::STOPPED | ServerStatus::ERROR) {
-                manager.status = ServerStatus::RUNNING;
-            }
-            if matches!(manager.status(), ServerStatus::STARTING) {
-                if let Some(started_at) = manager.started_at {
-                    if started_at.elapsed() > Duration::from_secs(8) {
-                        manager.status = ServerStatus::RUNNING;
-                    }
-                }
-            }
-        }
     }
     Ok(manager.status())
 }
@@ -1366,13 +1461,11 @@ async fn restore_backup(
     server_id: String,
     backup_id: String,
     state: State<'_, AppState>,
-    app: AppHandle,
 ) -> Result<(), String> {
     let data_dir = state.data_dir.clone();
     let registry_path = state.registry_path.clone();
     let legacy_config_path = state.legacy_config_path.clone();
     let process = state.process.clone();
-    let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let local_state = AppState {
             data_dir,
@@ -1383,18 +1476,7 @@ async fn restore_backup(
         let server_dir = resolve_server_dir(&local_state, &server_id)?;
         let running = is_server_running(&local_state)?;
         if running {
-            let mut manager = local_state
-                .process
-                .lock()
-                .map_err(|_| "Failed to lock process state")?;
-            if manager
-                .active_server_id
-                .as_deref()
-                .is_some_and(|active| active != server_id)
-            {
-                return Err("Another server is currently running".to_string());
-            }
-            manager.stop(&app)?;
+            return Err("Stop the server before restoring a backup.".to_string());
         }
 
         let manifest = load_backup_manifest(&local_state.data_dir, &server_id)?;
@@ -1403,29 +1485,61 @@ async fn restore_backup(
             .find(|item| item.id == backup_id)
             .ok_or("Backup not found")?;
 
-        let zip_file = File::open(&entry.path).map_err(|err| err.to_string())?;
-        let mut archive = zip::ZipArchive::new(zip_file).map_err(|err| err.to_string())?;
+        let restore_temp = local_state
+            .data_dir
+            .join("temp")
+            .join("backup-restore")
+            .join(format!("{}_{}", sanitize_name(&server_id), Utc::now().timestamp_millis()));
+        fs::create_dir_all(&restore_temp).map_err(|err| err.to_string())?;
+        safe_extract_zip(Path::new(&entry.path), &restore_temp)?;
 
-        for folder in ["world", "world_nether", "world_the_end"] {
-            let path = server_dir.join(folder);
-            if path.exists() {
-                fs::remove_dir_all(&path).map_err(|err| err.to_string())?;
+        let restored_world = restore_temp.join("world");
+        if !restored_world.exists() {
+            let _ = fs::remove_dir_all(&restore_temp);
+            return Err("Backup is missing the main world folder.".to_string());
+        }
+        validate_world_dir(&restored_world)?;
+
+        let backup_current = local_state
+            .data_dir
+            .join("temp")
+            .join("backup-restore-current")
+            .join(format!("{}_{}", sanitize_name(&server_id), Utc::now().timestamp_millis()));
+        fs::create_dir_all(&backup_current).map_err(|err| err.to_string())?;
+
+        let world_dirs = ["world", "world_nether", "world_the_end"];
+        let mut moved_current = Vec::new();
+        for folder in world_dirs {
+            let current = server_dir.join(folder);
+            if current.exists() {
+                let backup_path = backup_current.join(folder);
+                move_path(&current, &backup_path)?;
+                moved_current.push((current, backup_path));
             }
         }
 
-        for i in 0..archive.len() {
-            let mut file = archive.by_index(i).map_err(|err| err.to_string())?;
-            let outpath = server_dir.join(file.name());
-            if file.name().ends_with('/') {
-                fs::create_dir_all(&outpath).map_err(|err| err.to_string())?;
-            } else {
-                if let Some(parent) = outpath.parent() {
-                    fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        let mut installed: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for folder in world_dirs {
+            let extracted = restore_temp.join(folder);
+            if extracted.exists() {
+                let destination = server_dir.join(folder);
+                if let Err(err) = move_path(&extracted, &destination) {
+                    for (installed_path, backup_path) in installed.iter().rev() {
+                        let _ = move_path(installed_path, backup_path);
+                    }
+                    for (original_path, backup_path) in moved_current.iter().rev() {
+                        let _ = move_path(backup_path, original_path);
+                    }
+                    let _ = fs::remove_dir_all(&restore_temp);
+                    let _ = fs::remove_dir_all(&backup_current);
+                    return Err(err);
                 }
-                let mut outfile = File::create(&outpath).map_err(|err| err.to_string())?;
-                std::io::copy(&mut file, &mut outfile).map_err(|err| err.to_string())?;
+                installed.push((destination, extracted));
             }
         }
+
+        let _ = fs::remove_dir_all(&restore_temp);
+        let _ = fs::remove_dir_all(&backup_current);
 
         append_log(&local_state.data_dir, &format!("Backup restored: {}", backup_id));
         Ok(())
@@ -2071,6 +2185,100 @@ fn update_app_settings(app: AppHandle, settings: AppSettings) -> Result<AppSetti
 }
 
 #[tauri::command]
+fn get_storage_info(app: AppHandle) -> Result<StorageInfo, String> {
+    let base = app_data_dir(&app)?;
+    ensure_app_dirs(&base)?;
+    let server_dir = server_storage_dir(&base);
+    let logs = logs_dir(&base);
+    let runtime = runtime_root_dir(&base);
+    let backups = backups_dir(&base);
+    let temp = temp_dir(&base);
+    Ok(StorageInfo {
+        app_data_dir: base.to_string_lossy().to_string(),
+        server_storage_dir: server_dir.to_string_lossy().to_string(),
+        logs_dir: logs.to_string_lossy().to_string(),
+        runtime_dir: runtime.to_string_lossy().to_string(),
+        backups_dir: backups.to_string_lossy().to_string(),
+        temp_dir: temp.to_string_lossy().to_string(),
+        runtime_size_bytes: dir_size(&runtime),
+        backups_size_bytes: dir_size(&backups),
+    })
+}
+
+#[tauri::command]
+fn clear_app_logs(app: AppHandle) -> Result<(), String> {
+    let base = app_data_dir(&app)?;
+    ensure_app_dirs(&base)?;
+    reset_dir(&base, &logs_dir(&base))?;
+    append_app_log(&base, "INFO", "Logs were cleared from Settings > Storage.");
+    Ok(())
+}
+
+#[tauri::command]
+fn clear_java_runtimes(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    if is_server_running(&state)? {
+        return Err("Stop the server before clearing downloaded Java runtimes.".to_string());
+    }
+    let base = app_data_dir(&app)?;
+    ensure_app_dirs(&base)?;
+    reset_dir(&base, &runtime_java_dir(&base))?;
+    let extract_dir = runtime_root_dir(&base).join("java_extract");
+    if extract_dir.exists() {
+        reset_dir(&base, &extract_dir)?;
+    }
+    append_app_log(&base, "INFO", "Downloaded Java runtimes were cleared from Settings > Storage.");
+    Ok(())
+}
+
+#[tauri::command]
+fn clear_temp_files(app: AppHandle) -> Result<(), String> {
+    let base = app_data_dir(&app)?;
+    ensure_app_dirs(&base)?;
+    reset_dir(&base, &temp_dir(&base))?;
+    let extract_dir = runtime_root_dir(&base).join("java_extract");
+    if extract_dir.exists() {
+        reset_dir(&base, &extract_dir)?;
+    }
+    append_app_log(&base, "INFO", "Temporary files were cleared from Settings > Storage.");
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_all_app_data_and_exit(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    let base = app_data_dir(&app)?;
+    ensure_app_dirs(&base)?;
+
+    let active_server_id = {
+        let manager = state
+            .process
+            .lock()
+            .map_err(|_| "Failed to lock process state")?;
+        manager.active_server_id.clone()
+    };
+
+    if let Some(server_id) = active_server_id {
+        stop_server(server_id, state, app.clone())?;
+    }
+
+    for dir in [
+        base.join("configs"),
+        logs_dir(&base),
+        runtime_root_dir(&base),
+        crashes_dir(&base),
+        server_storage_dir(&base),
+        backups_dir(&base),
+        temp_dir(&base),
+        base.join("updates"),
+    ] {
+        remove_dir_if_exists(&base, &dir)?;
+    }
+
+    remove_file_if_exists(&base, &analytics_path(&base))?;
+    app.exit(0);
+    Ok(())
+}
+
+#[tauri::command]
 fn list_crash_reports(app: AppHandle) -> Result<Vec<CrashReportSummary>, String> {
     let base = app_data_dir(&app)?;
     ensure_app_dirs(&base)?;
@@ -2205,6 +2413,7 @@ fn check_for_updates(repo: String, app: AppHandle) -> Result<UpdateInfo, String>
         update_available: false,
         latest_version: None,
         download_url: None,
+        checksum_url: None,
     };
 
     if repo.trim().is_empty() {
@@ -2238,38 +2447,61 @@ fn check_for_updates(repo: String, app: AppHandle) -> Result<UpdateInfo, String>
     }
 
     info.update_available = true;
-    let download_url = payload
+    let installer_asset = payload
         .get("assets")
         .and_then(|value| value.as_array())
         .and_then(|assets| {
             assets
                 .iter()
-                .filter_map(|asset| asset.get("browser_download_url").and_then(|url| url.as_str()))
-                .find(|url| url.to_ascii_lowercase().ends_with(".msi"))
-                .map(|value| value.to_string())
-                .or_else(|| {
-                    assets
-                        .iter()
-                        .filter_map(|asset| asset.get("browser_download_url").and_then(|url| url.as_str()))
-                        .next()
-                        .map(|value| value.to_string())
+                .find(|asset| {
+                    asset
+                        .get("browser_download_url")
+                        .and_then(|url| url.as_str())
+                        .is_some_and(|url| {
+                            let url = url.to_ascii_lowercase();
+                            url.ends_with(".exe") && url.contains("gamehost-one-setup-v")
+                        })
                 })
         });
-    info.download_url = download_url;
+    let checksum_asset = payload
+        .get("assets")
+        .and_then(|value| value.as_array())
+        .and_then(|assets| {
+            assets
+                .iter()
+                .find(|asset| {
+                    asset
+                        .get("browser_download_url")
+                        .and_then(|url| url.as_str())
+                        .is_some_and(|url| {
+                            let url = url.to_ascii_lowercase();
+                            url.ends_with(".exe.sha256") && url.contains("gamehost-one-setup-v")
+                        })
+                })
+        });
+    info.download_url = installer_asset
+        .and_then(|asset| asset.get("browser_download_url").and_then(|url| url.as_str()))
+        .map(|value| value.to_string());
+    info.checksum_url = checksum_asset
+        .and_then(|asset| asset.get("browser_download_url").and_then(|url| url.as_str()))
+        .map(|value| value.to_string());
     Ok(info)
 }
 
 #[tauri::command]
-fn download_update(download_url: String, app: AppHandle) -> Result<String, String> {
+fn download_update(download_url: String, checksum_url: String, app: AppHandle) -> Result<String, String> {
     if download_url.trim().is_empty() {
         return Err("Missing download URL".to_string());
+    }
+    if checksum_url.trim().is_empty() {
+        return Err("Missing checksum for this update. Installation is blocked.".to_string());
     }
     let base = app_data_dir(&app)?;
     ensure_app_dirs(&base)?;
     let updates_dir = base.join("updates");
     fs::create_dir_all(&updates_dir).map_err(|err| err.to_string())?;
 
-    let file_name = filename_from_url(&download_url).unwrap_or_else(|_| "update.msi".to_string());
+    let file_name = filename_from_url(&download_url).unwrap_or_else(|_| "update.exe".to_string());
     let destination = updates_dir.join(file_name);
     let client = reqwest::blocking::Client::new();
     let mut response = client.get(&download_url).send().map_err(|err| err.to_string())?;
@@ -2278,17 +2510,22 @@ fn download_update(download_url: String, app: AppHandle) -> Result<String, Strin
     }
     let mut file = File::create(&destination).map_err(|err| err.to_string())?;
     response.copy_to(&mut file).map_err(|err| err.to_string())?;
+    let expected = fetch_sha256_text(&client, &checksum_url)?;
+    let actual = sha256_file(&destination)?;
+    if actual.to_lowercase() != expected.to_lowercase() {
+        let _ = fs::remove_file(&destination);
+        return Err("Update verification failed. The downloaded installer checksum did not match.".to_string());
+    }
     Ok(destination.to_string_lossy().to_string())
 }
 
 #[tauri::command]
-fn install_update(download_url: String, app: AppHandle) -> Result<(), String> {
-    let path = download_update(download_url, app.clone())?;
+fn install_update(download_url: String, checksum_url: String, app: AppHandle) -> Result<(), String> {
+    let path = download_update(download_url, checksum_url, app.clone())?;
     #[cfg(target_os = "windows")]
     {
-        Command::new("msiexec")
-            .arg("/i")
-            .arg(&path)
+        Command::new(&path)
+            .arg("/S")
             .spawn()
             .map_err(|err| err.to_string())?;
     }
@@ -2365,8 +2602,9 @@ fn spawn_exit_watcher(process: Arc<Mutex<ProcessManager>>, app: AppHandle) {
                 manager.child = None;
                 manager.stdin = None;
                 manager.pid = None;
+                manager.started_at = None;
                 manager.active_server_id = None;
-                manager.status = if exit_status.success() {
+                manager.status = if matches!(manager.status, ServerStatus::STOPPING) || exit_status.success() {
                     ServerStatus::STOPPED
                 } else {
                     ServerStatus::ERROR
@@ -2499,6 +2737,10 @@ fn app_settings_path(base: &Path) -> PathBuf {
     base.join("configs").join("settings.json")
 }
 
+fn app_log_path(base: &Path) -> PathBuf {
+    base.join("logs").join("app.log")
+}
+
 fn analytics_path(base: &Path) -> PathBuf {
     base.join("analytics.json")
 }
@@ -2507,13 +2749,33 @@ fn crashes_dir(base: &Path) -> PathBuf {
     base.join("crashes")
 }
 
+fn server_storage_dir(base: &Path) -> PathBuf {
+    base.join("servers")
+}
+
+fn logs_dir(base: &Path) -> PathBuf {
+    base.join("logs")
+}
+
+fn runtime_root_dir(base: &Path) -> PathBuf {
+    base.join("runtime")
+}
+
 fn runtime_java_dir(base: &Path) -> PathBuf {
-    base.join("runtime").join("java")
+    runtime_root_dir(base).join("java")
 }
 
 fn runtime_java_exe(base: &Path) -> PathBuf {
     let binary = if cfg!(target_os = "windows") { "java.exe" } else { "java" };
     runtime_java_dir(base).join("bin").join(binary)
+}
+
+fn backups_dir(base: &Path) -> PathBuf {
+    base.join("backups")
+}
+
+fn temp_dir(base: &Path) -> PathBuf {
+    base.join("temp")
 }
 
 fn load_java_config(base: &Path) -> JavaConfig {
@@ -2537,19 +2799,165 @@ fn save_java_config(base: &Path, config: &JavaConfig) -> Result<(), String> {
 fn load_app_settings(base: &Path) -> AppSettings {
     let path = app_settings_path(base);
     if !path.exists() {
-        return AppSettings::default();
+        let settings = AppSettings::default();
+        let _ = save_app_settings(base, &settings);
+        return settings;
     }
     let content = match fs::read_to_string(&path) {
         Ok(value) => value,
-        Err(_) => return AppSettings::default(),
+        Err(err) => {
+            append_app_log(base, "WARN", &format!("Failed to read settings.json: {}", err));
+            let settings = AppSettings::default();
+            let _ = save_app_settings(base, &settings);
+            return settings;
+        }
     };
-    serde_json::from_str(&content).unwrap_or_default()
+    let mut value = match serde_json::from_str::<Value>(&content) {
+        Ok(value) => value,
+        Err(err) => {
+            append_app_log(base, "WARN", &format!("Failed to parse settings.json: {}", err));
+            let settings = AppSettings::default();
+            let _ = save_app_settings(base, &settings);
+            return settings;
+        }
+    };
+    let migrated = migrate_app_settings_value(&mut value);
+    match serde_json::from_value::<AppSettings>(value) {
+        Ok(settings) => {
+            if migrated {
+                let _ = save_app_settings(base, &settings);
+            }
+            settings
+        }
+        Err(err) => {
+            append_app_log(base, "WARN", &format!("Failed to decode migrated settings.json: {}", err));
+            let settings = AppSettings::default();
+            let _ = save_app_settings(base, &settings);
+            settings
+        }
+    }
 }
 
 fn save_app_settings(base: &Path, settings: &AppSettings) -> Result<(), String> {
     let path = app_settings_path(base);
     let payload = serde_json::to_string_pretty(settings).map_err(|err| err.to_string())?;
     fs::write(path, payload).map_err(|err| err.to_string())
+}
+
+fn migrate_app_settings_value(value: &mut Value) -> bool {
+    let mut changed = false;
+    let defaults = serde_json::to_value(AppSettings::default()).unwrap_or_else(|_| Value::Object(Map::new()));
+    if !value.is_object() {
+        *value = defaults;
+        return true;
+    }
+    if let Some(map) = value.as_object_mut() {
+        changed |= migrate_app_settings_key(map, "analytics_enabled", "analyticsEnabled");
+        changed |= migrate_app_settings_key(map, "crash_reporting_enabled", "crashReportingEnabled");
+        changed |= migrate_app_settings_key(map, "analytics_endpoint", "analyticsEndpoint");
+        changed |= migrate_app_settings_key(map, "launcher_path", "launcherPath");
+        changed |= migrate_app_settings_key(map, "smart_join_panel_enabled", "smartJoinPanelEnabled");
+        changed |= migrate_app_settings_key(map, "notify_on_server_start", "notifyServerStart");
+        changed |= migrate_app_settings_key(map, "notify_on_server_stop", "notifyServerStop");
+        changed |= migrate_app_settings_key(map, "notify_on_server_error", "notifyServerCrash");
+        changed |= migrate_app_settings_key(map, "notify_on_server_crash", "notifyServerCrash");
+        changed |= migrate_app_settings_key(map, "minimize_to_tray_on_close", "minimizeToTrayOnClose");
+        changed |= migrate_app_settings_key(map, "dismissed_close_to_tray_hint", "dismissedCloseToTrayHint");
+        changed |= migrate_app_settings_key(map, "mod_sync_mode", "modSyncMode");
+    }
+    changed | merge_json_defaults(value, &defaults)
+}
+
+fn migrate_app_settings_key(map: &mut Map<String, Value>, legacy: &str, canonical: &str) -> bool {
+    if map.contains_key(canonical) {
+        return false;
+    }
+    match map.remove(legacy) {
+        Some(value) => {
+            map.insert(canonical.to_string(), value);
+            true
+        }
+        None => false,
+    }
+}
+
+fn merge_json_defaults(target: &mut Value, defaults: &Value) -> bool {
+    match (target, defaults) {
+        (Value::Object(target_map), Value::Object(default_map)) => {
+            let mut changed = false;
+            for (key, default_value) in default_map {
+                match target_map.get_mut(key) {
+                    Some(existing) => {
+                        changed |= merge_json_defaults(existing, default_value);
+                    }
+                    None => {
+                        target_map.insert(key.clone(), default_value.clone());
+                        changed = true;
+                    }
+                }
+            }
+            changed
+        }
+        _ => false,
+    }
+}
+
+fn append_app_log(base: &Path, level: &str, message: &str) {
+    let path = app_log_path(base);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let timestamp = Utc::now().to_rfc3339();
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "[{}] {} {}", timestamp, level, message);
+    }
+}
+
+fn dir_size(path: &Path) -> u64 {
+    if !path.exists() {
+        return 0;
+    }
+    WalkDir::new(path)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.len())
+        .sum()
+}
+
+fn ensure_path_inside(root: &Path, candidate: &Path) -> Result<(), String> {
+    let normalized_root = root.components().collect::<PathBuf>();
+    let normalized_candidate = candidate.components().collect::<PathBuf>();
+    if normalized_candidate.starts_with(&normalized_root) {
+        Ok(())
+    } else {
+        Err(format!("Refusing to touch path outside app data root: {}", candidate.display()))
+    }
+}
+
+fn reset_dir(base: &Path, path: &Path) -> Result<(), String> {
+    ensure_path_inside(base, path)?;
+    if path.exists() {
+        fs::remove_dir_all(path).map_err(|err| err.to_string())?;
+    }
+    fs::create_dir_all(path).map_err(|err| err.to_string())
+}
+
+fn remove_dir_if_exists(base: &Path, path: &Path) -> Result<(), String> {
+    ensure_path_inside(base, path)?;
+    if path.exists() {
+        fs::remove_dir_all(path).map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+fn remove_file_if_exists(base: &Path, path: &Path) -> Result<(), String> {
+    ensure_path_inside(base, path)?;
+    if path.exists() {
+        fs::remove_file(path).map_err(|err| err.to_string())?;
+    }
+    Ok(())
 }
 
 fn log_analytics_event(base: &Path, settings: &AppSettings, name: &str) {
@@ -2576,7 +2984,7 @@ fn log_analytics_event(base: &Path, settings: &AppSettings, name: &str) {
     }
 
     if let Some(endpoint) = settings.analytics_endpoint.as_deref() {
-        if endpoint.starts_with("http") {
+        if endpoint.starts_with("https://") {
             let endpoint = endpoint.to_string();
             let entry = entry.clone();
             std::thread::spawn(move || {
@@ -2986,6 +3394,46 @@ fn sha256_file(path: &Path) -> Result<String, String> {
         hasher.update(&buffer[..read]);
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+fn fetch_sha256_text(client: &reqwest::blocking::Client, checksum_url: &str) -> Result<String, String> {
+    ensure_https(checksum_url)?;
+    let response = client.get(checksum_url).send().map_err(|err| err.to_string())?;
+    if !response.status().is_success() {
+        return Err("Update checksum is missing. Installation is blocked.".to_string());
+    }
+    let text = response.text().map_err(|err| err.to_string())?;
+    let expected = text
+        .split_whitespace()
+        .next()
+        .ok_or("Invalid update checksum file".to_string())?;
+    Ok(expected.to_string())
+}
+
+fn move_path(source: &Path, destination: &Path) -> Result<(), String> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    if destination.exists() {
+        if destination.is_dir() {
+            fs::remove_dir_all(destination).map_err(|err| err.to_string())?;
+        } else {
+            fs::remove_file(destination).map_err(|err| err.to_string())?;
+        }
+    }
+    match fs::rename(source, destination) {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            if source.is_dir() {
+                copy_dir_recursive(source, destination)?;
+                fs::remove_dir_all(source).map_err(|err| err.to_string())?;
+            } else {
+                fs::copy(source, destination).map_err(|err| err.to_string())?;
+                fs::remove_file(source).map_err(|err| err.to_string())?;
+            }
+            Ok(())
+        }
+    }
 }
 
 fn is_allowed_mod_url(url: &str) -> Result<(), String> {
@@ -4740,13 +5188,13 @@ fn is_server_running(state: &AppState) -> Result<bool, String> {
         .map_err(|_| "Failed to lock process state")?;
     Ok(matches!(
         manager.status(),
-        ServerStatus::RUNNING | ServerStatus::STARTING
+        ServerStatus::PREPARING | ServerStatus::STARTING | ServerStatus::RUNNING | ServerStatus::STOPPING
     ))
 }
 
 fn write_server_properties(server_dir: &Path, port: u16, online_mode: bool) -> Result<(), String> {
     let content = format!(
-        "server-port={}\nonline-mode={}\nmotd=Gamehost ONE\n",
+        "server-port={}\nonline-mode={}\nmotd=GameHost ONE\n",
         port, online_mode
     );
     fs::write(server_dir.join("server.properties"), content).map_err(|err| err.to_string())
@@ -5486,8 +5934,27 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let handle = app.handle();
-            let data_dir = app_data_dir(&handle)?;
-            ensure_app_dirs(&data_dir)?;
+            let data_dir = match app_data_dir(&handle) {
+                Ok(path) => path,
+                Err(err) => return Err(err.into()),
+            };
+            if let Err(err) = ensure_app_dirs(&data_dir) {
+                append_app_log(&data_dir, "ERROR", &format!("Failed to prepare app directories: {}", err));
+                return Err(err.into());
+            }
+            append_app_log(&data_dir, "INFO", "Starting GameHost ONE release runtime.");
+            let settings = load_app_settings(&data_dir);
+            append_app_log(
+                &data_dir,
+                "INFO",
+                &format!(
+                    "Settings loaded. minimizeToTrayOnClose={}, notifyServerStart={}, notifyServerStop={}, notifyServerCrash={}",
+                    settings.minimize_to_tray_on_close,
+                    settings.notify_on_server_start,
+                    settings.notify_on_server_stop,
+                    settings.notify_on_server_error
+                ),
+            );
 
             let hook_handle = handle.clone();
             let hook_dir = data_dir.clone();
@@ -5504,6 +5971,7 @@ pub fn run() {
                     .map(|loc| format!("{}:{}", loc.file(), loc.line()))
                     .unwrap_or_else(|| "unknown".to_string());
                 let full_message = format!("{} ({})", message, location);
+                append_app_log(&hook_dir, "ERROR", &format!("Panic: {}", full_message));
                 let settings = load_app_settings(&hook_dir);
                 let app_version = hook_handle.package_info().version.to_string();
                 write_crash_report(&hook_dir, &settings, &app_version, &full_message);
@@ -5517,19 +5985,36 @@ pub fn run() {
             };
 
             app.manage(state);
-            setup_tray(&handle)?;
+            if let Err(err) = setup_tray(&handle) {
+                append_app_log(&data_dir, "ERROR", &format!("Failed to initialize tray: {}", err));
+                return Err(err.into());
+            }
+            append_app_log(&data_dir, "INFO", "Tray initialized.");
             start_backup_scheduler(handle.clone());
+            append_app_log(&data_dir, "INFO", "Backup scheduler initialized.");
 
             if let Some(window) = app.get_webview_window("main") {
                 apply_webview_corner_preference(&window);
+                append_app_log(&data_dir, "INFO", "Main window initialized.");
             }
+            append_app_log(&data_dir, "INFO", "Startup complete.");
             Ok(())
         })
         .on_window_event(|window, event| {
             match event {
                 WindowEvent::CloseRequested { api, .. } => {
-                    let _ = window.hide();
-                    api.prevent_close();
+                    let app = window.app_handle();
+                    let minimize_to_tray = app_data_dir(&app)
+                        .ok()
+                        .map(|base| load_app_settings(&base).minimize_to_tray_on_close)
+                        .unwrap_or(true);
+                    if minimize_to_tray {
+                        if let Ok(base) = app_data_dir(&app) {
+                            append_app_log(&base, "INFO", "Close requested; hiding window to tray.");
+                        }
+                        let _ = window.hide();
+                        api.prevent_close();
+                    }
                 }
                 WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                     apply_window_corner_preference(window);
@@ -5593,6 +6078,11 @@ pub fn run() {
             launch_minecraft,
             get_app_settings,
             update_app_settings,
+            get_storage_info,
+            clear_app_logs,
+            clear_java_runtimes,
+            clear_temp_files,
+            delete_all_app_data_and_exit,
             list_crash_reports,
             get_crash_report,
             delete_crash_report,
@@ -5636,7 +6126,7 @@ fn setup_tray(app: &AppHandle) -> Result<(), String> {
 
     TrayIconBuilder::new()
         .icon(icon)
-        .tooltip("Gamehost ONE")
+        .tooltip("GameHost ONE")
         .menu(&menu)
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::DoubleClick { .. } = event {
@@ -5681,6 +6171,9 @@ fn setup_tray(app: &AppHandle) -> Result<(), String> {
                 }
             }
             "exit" => {
+                if let Ok(base) = app_data_dir(app) {
+                    append_app_log(&base, "INFO", "Exit requested from tray menu.");
+                }
                 app.exit(0);
             }
             _ => {}

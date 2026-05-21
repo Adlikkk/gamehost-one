@@ -13,7 +13,7 @@ Crash reporting in GameHost ONE is opt-in and disabled by default.
 
 Crash reports are saved locally at:
 
-AppData/GameHostOne/crashes/
+`%APPDATA%\com.gamehost.one\crashes`
 
 ## Export
 

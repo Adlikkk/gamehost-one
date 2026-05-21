@@ -35,7 +35,7 @@ export function ImportServerModal({
         <p className="text-xs uppercase tracking-[0.2em] text-muted">Import server</p>
         <h3 className="mt-2 font-display text-xl text-text">Import existing Minecraft server</h3>
         <p className="mt-2 text-sm text-muted">
-          Link an existing server folder or copy it into Gamehost ONE.
+          Link an existing server folder or copy it into GameHost ONE.
         </p>
 
         <div className="mt-4 grid gap-3">
@@ -94,7 +94,7 @@ export function ImportServerModal({
                 )}
                 onClick={() => onModeChange("copy")}
               >
-                Copy into Gamehost (recommended)
+                Copy into GameHost (recommended)
               </button>
               <button
                 type="button"

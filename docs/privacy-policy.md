@@ -21,7 +21,7 @@ These events contain no personal data and do not include server content.
 
 ## Data Storage
 
-By default, analytics and crash reports are stored locally in your AppData folder.
+By default, analytics and crash reports are stored locally in `%APPDATA%\com.gamehost.one`.
 No data is uploaded automatically.
 
 ## Updates

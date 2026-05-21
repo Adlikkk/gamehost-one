@@ -22,7 +22,7 @@ export function TitleBar({
   return (
     <header className="titlebar relative flex items-center justify-between border-b border-white/10 px-5 py-3">
       <div className="flex items-center gap-3">
-        <img src="/logo.png" alt="Gamehost ONE" className="h-7 w-7 rounded-lg" />
+        <img src="/logo.png" alt="GameHost ONE" className="h-7 w-7 rounded-lg" />
         <BrandName className="text-sm font-semibold" />
       </div>
       <div className="flex items-center gap-2">

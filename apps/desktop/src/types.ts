@@ -1,6 +1,6 @@
 export type View = "loading" | "welcome" | "library" | "servers" | "wizard" | "migration" | "detail" | "settings";
 
-export type ServerStatus = "STOPPED" | "STARTING" | "RUNNING" | "ERROR";
+export type ServerStatus = "STOPPED" | "PREPARING" | "STARTING" | "RUNNING" | "STOPPING" | "ERROR";
 
 export type ServerConfig = {
   name: string;
@@ -167,19 +167,35 @@ export type ClientDetectionResult = {
 };
 
 export type AppSettings = {
-  analytics_enabled: boolean;
-  crash_reporting_enabled: boolean;
-  analytics_endpoint?: string | null;
-  launcher_path?: string | null;
-  smart_join_panel_enabled?: boolean;
-  notify_on_server_start?: boolean;
-  mod_sync_mode?: "ask" | "metadata" | "copy";
+  analyticsEnabled: boolean;
+  crashReportingEnabled: boolean;
+  analyticsEndpoint?: string | null;
+  launcherPath?: string | null;
+  smartJoinPanelEnabled?: boolean;
+  notifyServerStart?: boolean;
+  notifyServerStop?: boolean;
+  notifyServerCrash?: boolean;
+  minimizeToTrayOnClose?: boolean;
+  dismissedCloseToTrayHint?: boolean;
+  modSyncMode?: "ask" | "metadata" | "copy";
+};
+
+export type StorageInfo = {
+  app_data_dir: string;
+  server_storage_dir: string;
+  logs_dir: string;
+  runtime_dir: string;
+  backups_dir: string;
+  temp_dir: string;
+  runtime_size_bytes: number;
+  backups_size_bytes: number;
 };
 
 export type UpdateInfo = {
   update_available: boolean;
   latest_version?: string | null;
   download_url?: string | null;
+  checksum_url?: string | null;
 };
 
 export type CrashReportSummary = {

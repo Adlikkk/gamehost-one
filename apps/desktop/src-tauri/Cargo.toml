@@ -1,9 +1,11 @@
 [package]
 name = "gamehostone"
-version = "0.5.0"
-description = "A Tauri App"
-authors = ["you"]
+version = "0.5.1"
+description = "Local-first Minecraft server control."
+authors = ["GameHost ONE"]
 edition = "2021"
+license = "MIT"
+homepage = "https://github.com/Adlikkk/gamehost-one-app"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -50,4 +52,3 @@ windows = { version = "0.61.3", features = [
 	"Win32_System_Memory"
 ] }
 raw-window-handle = "0.6"
-
